@@ -23,23 +23,6 @@
 
 ## 安装
 
-### 方式一：成品包（推荐，零依赖下载）
-
-到 [Releases](https://github.com/spiritherb02/debinstaller/releases) 下载 `.pkg.tar.zst`，然后：
-
-```bash
-sudo pacman -U debinstaller-*.pkg.tar.zst
-```
-
-### 方式二：一行命令（脚本安装，自动装到 /usr/local）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/spiritherb02/debinstaller/main/install.sh | sudo bash
-```
-
-### 方式三：源码安装
-
-
 ```bash
 sudo ./install.sh            # 安装到 /usr/local
 sudo PREFIX=/usr ./install.sh
