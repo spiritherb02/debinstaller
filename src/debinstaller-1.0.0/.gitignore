@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-*.pkg.tar.zst
-*.pkg.tar.xz
-build/
-dist/
