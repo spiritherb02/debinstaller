@@ -6,9 +6,15 @@
 #   ./build-appimage.sh --appdir-only   只组装 AppDir，不做 squashfs
 #
 # 需要两样本脚本**不会**自动下载的东西：
-#   1) mksquashfs        —— sudo pacman -S squashfs-tools
-#   2) type2 runtime ELF —— AppImageKit 的 runtime-x86_64，放到
-#      APPIMAGE_RUNTIME=<路径> 指给它（默认找 ./runtime-x86_64 和 ~/.cache/）
+#   1) mksquashfs —— sudo pacman -S squashfs-tools；没装也能借，
+#      用 MKSQUASHFS=<路径> 指一个现成的二进制过来
+#   2) type-2 runtime —— 用 AppImage/type2-runtime 的 runtime-x86_64，
+#      放 ./runtime-x86_64、~/.cache/appimagetool/，或 APPIMAGE_RUNTIME=<路径>
+#      别用 AppImageKit continuous 那个：它只会 dlopen libfuse.so.2，
+#      现在的 Arch 只有 fuse3，双击起不来
+#
+# squashfs 默认 gzip：那是两个 runtime 内置读取器的交集（旧的认 zlib/xz，
+# 新的认 zlib/zstd）。要换算法用 APPIMAGE_COMP=<算法>。
 #
 # 说清楚一点：打出来的 AppImage **仍然只能在 Arch 系跑**。这个工具的正文是
 # shell + Python，运行时要调宿主的 pacman / dpkg-deb / fakeroot，
@@ -119,22 +125,31 @@ if [ -z "$RT" ]; then
     warn "缺少 type-2 runtime（AppImage 的 ELF 头）"
     echo
     echo "  补齐这两样之后再跑一次："
-    echo "    sudo pacman -S squashfs-tools"
-    echo "    # runtime-x86_64 从 AppImageKit 的 release 里取，自己核对校验和："
-    echo "    #   https://github.com/AppImage/AppImageKit/releases"
+    echo "    sudo pacman -S squashfs-tools        # 或 MKSQUASHFS=<现成的 mksquashfs>"
+    echo "    # runtime 取 AppImage/type2-runtime 的（AppImageKit continuous 那个只认"
+    echo "    # libfuse.so.2，如今的 Arch 双击起不来），自己核对校验和："
+    echo "    #   https://github.com/AppImage/type2-runtime/releases/continuous"
     echo "    export APPIMAGE_RUNTIME=/你的路径/runtime-$ARCH_TAG"
     exit 3
 fi
 
-command -v mksquashfs >/dev/null 2>&1 || {
-    warn "没有 mksquashfs（sudo pacman -S squashfs-tools）"
+command -v mksquashfs >/dev/null 2>&1 || [ -n "${MKSQUASHFS:-}" ] || {
+    warn "没有 mksquashfs（sudo pacman -S squashfs-tools，或用 MKSQUASHFS=<路径> 指一个）"
     exit 3
 }
+MKSQ=${MKSQUASHFS:-$(command -v mksquashfs || true)}
+if [ -z "$MKSQ" ] || [ ! -x "$MKSQ" ]; then
+    warn "找不到可执行的 mksquashfs：$MKSQ"
+    exit 3
+fi
 
 rm -f "$TARGET"
 SQ=$(mktemp --suffix=.squashfs)
 trap 'rm -f "$SQ"' EXIT
-mksquashfs "$APPDIR" "$SQ" -root-owned -noappend -comp zstd -b 1M -no-xattrs >/dev/null
+# 压缩算法要挑两边 runtime 都认的：AppImageKit 那个自带 zlib/xz，
+# type2-runtime 那个自带 zlib/zstd —— 交集是 zlib，所以默认用它。
+"$MKSQ" "$APPDIR" "$SQ" -root-owned -noappend \
+    -comp "${APPIMAGE_COMP:-gzip}" -b 1M -no-xattrs >/dev/null
 # type-2 = ELF runtime 在前，squashfs 拼在后面
 cat "$RT" "$SQ" > "$TARGET"
 chmod +x "$TARGET"
@@ -147,5 +162,5 @@ echo
 echo "  自检："
 file -b "$TARGET" | sed 's/^/    /'
 echo
-echo "  试用（不安装）：  ./$TARGET --appimage-extract-and-run"
+echo "  试用（不安装）：  $(basename "$TARGET") --appimage-extract-and-run"
 echo "  塞进自己的菜单：  双击它，用本工具的 .AppImage 分支移入 ~/Applications"

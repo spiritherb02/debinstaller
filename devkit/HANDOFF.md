@@ -354,25 +354,29 @@ _install_appimage(path, want_desktop)
 文件名** —— 否则 `slugify("软件包安装程序")` 会得到通用的 `appimage`，
 两个中文名的 AppImage 会互相覆盖菜单项。`run-checks.sh` 里有这条静态守卫。
 
-### 5.7 打本工具自己的 .AppImage（可行性结论）
+### 5.7 打本工具自己的 .AppImage
 
-`./build-appimage.sh` 组装 AppDir 是通的（`--appdir-only` 随时可验，
-`desktop-file-validate` 也过）；**只差两样脚本刻意不去自动下载的东西**：
+`./build-appimage.sh` 已经能用，产物 `PackageInstaller-<版本>-x86_64.AppImage`
+在 Release 页上。踩过的两个坑，别再踩：
 
-| 缺什么 | 怎么补 |
-|---|---|
-| `mksquashfs` | `sudo pacman -S squashfs-tools`（extra 里有） |
-| type-2 runtime（ELF 头） | 从 AppImageKit release 拿 `runtime-x86_64`，自己核对校验和，再用 `APPIMAGE_RUNTIME=<路径>` 指过来 |
+1. **runtime 用 [AppImage/type2-runtime](https://github.com/AppImage/type2-runtime)，
+   不要用 AppImageKit continuous 那个。** 后者只会 `dlopen("libfuse.so.2")`，
+   而 Arch 早就只剩 fuse3，双击起不来（`--appimage-mount` 直接报
+   `error loading libfuse.so.2`）。type2-runtime 认 `fusermount3`，能用。
+2. **squashfs 的压缩算法要取两个 runtime 的交集。** AppImageKit 那个内置
+   zlib + xz，type2-runtime 那个内置 zlib + zstd —— **只有 gzip 两边都认**。
+   用 zstd 压的，旧 runtime 报 `uses (null) compression`；用 xz 的，新 runtime
+   报 `supports only zlib, zstd`。默认就是 gzip；要换用 `APPIMAGE_COMP=<算法>`。
 
-结论：**能做，但价值有限，所以本版没随发布放 AppImage。** 原因是这个工具的
-正文是 shell + Python，运行时要调宿主的 `pacman` / `dpkg-deb` / `fakeroot`，
-图形界面还要宿主的 `python-gobject` + `gtk3` —— 这些 AppImage 装不进去，
-它省掉的只是"安装本工具"这一步，不是"任何发行版都能跑"。也就是说打出来的
-仍然是 Arch-only 的包，和 tar.gz 相比只多了免安装。
+不需要 appimagetool：type-2 格式就是 `cat runtime rootfs.squashfs > X.AppImage`。
+本机没装 squashfs-tools 时用 `MKSQUASHFS=<路径>` 指一个现成的 `mksquashfs` 过去。
 
-顺带一提：真打出来之后，把它双击丢给本工具自己就能装（`.AppImage` 分支会
-认出 `usr/share/applications/` 里的桌面入口和 hicolor 图标）—— 这是
-`build-appimage.sh` 里那两份 `.desktop` 和图标目录存在的原因，别精简掉。
+自检四步：`file -b` 是 ELF → `--appimage-extract` 解得出 `AppRun` →
+`--appimage-mount` 挂得上 → 把它双击交给本工具自己（`.AppImage` 分支），
+确认菜单项、图标、卸载清单都出来了。
+
+仍然要说清楚：这个 AppImage **不解决宿主依赖**，`pacman`/`dpkg-deb`/
+`python-gobject`/`gtk3` 还得系统里有，所以它只省掉"装本工具"这一步。
 
 ---
 

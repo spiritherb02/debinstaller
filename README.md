@@ -66,6 +66,48 @@ sudo PREFIX=/usr/local ./install.sh
 
 装完会用 `~/.local/share/debinstall/manifest.txt` 记账，方便卸载。
 
+### `.AppImage`（连"安装"这一步都省了）
+
+[Releases](../../releases) 里有 `PackageInstaller-<版本>-x86_64.AppImage`，
+下载后双击就能用，不装、不要 root。里面跑的还是同一套脚本，所以**仍然只能
+在 Arch 系上用**：装 `.deb` 要调宿主的 `pacman` / `dpkg-deb`，图形界面要
+宿主的 `python-gobject` + `gtk3`。
+
+#### 双击打不开怎么办
+
+浏览器下载的文件默认没有可执行位，桌面环境出于安全还会再拦一道。按顺序试：
+
+```bash
+chmod +x PackageInstaller-*.AppImage
+```
+
+或者在文件管理器里勾：Dolphin 右键 → 属性 → 权限 → 勾「允许以程序执行文件」；
+GNOME Files 右键 → 属性 → 「允许以可执行文件运行」。
+
+KDE 首次双击会弹「此文件不受信任」，点「信任」就行；命令行版是：
+
+```bash
+gio set PackageInstaller-*.AppImage metadata::trusted true
+```
+
+如果报找不到 `fusermount`，说明缺 FUSE：
+
+```bash
+sudo pacman -S fuse3
+# 不想装 FUSE 就让它解压到临时目录再跑：
+APPIMAGE_EXTRACT_AND_RUN=1 ./PackageInstaller-*.AppImage
+```
+
+#### 让它进开始菜单、双击 .deb 就打开
+
+把这个 `.AppImage` 再双击交给本工具自己（`.AppImage` 分支会移进
+`~/Applications` 并注册菜单），然后关联一次文件类型：
+
+```bash
+xdg-mime default PackageInstaller.desktop application/vnd.debian.binary-package
+xdg-mime default PackageInstaller.desktop application/vnd.appimage
+```
+
 ### 依赖
 
 安装脚本会自己检查，缺哪个会告诉你。手动核对的话：
@@ -166,10 +208,10 @@ deb-install --raw 某个包.deb        # 不走 pacman，直接解包铺到 /
 - **AppImage 分支只看元数据。** 不检查依赖、不审安装脚本（AppImage 里
   也没有），并且目前没有图形化的卸载入口 —— 手动删 `~/Applications` 里
   那个文件和 `~/.local/share/applications/<名字>.desktop` 即可。
-- **本程序自己没有发布 `.AppImage` 版。** `build-appimage.sh` 能组装出
-  合法的 AppDir，但打出来仍然是 Arch-only：它运行时调宿主的
-  `pacman` / `dpkg-deb`，图形界面还要宿主的 `python-gobject` + `gtk3`，
-  这些都装不进 AppImage。理由写在 `devkit/HANDOFF.md` §5.7。
+- **`.AppImage` 版同样 Arch-only。** 它省掉的是"装本工具"这一步，不是宿主
+  依赖 —— `pacman` / `dpkg-deb` / `python-gobject` / `gtk3` 都得系统里有。
+  打包脚本是 `build-appimage.sh`；runtime 和 squashfs 压缩算法的兼容性坑
+  记录在 `devkit/HANDOFF.md` §5.7。
 
 ---
 
