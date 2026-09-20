@@ -187,16 +187,6 @@ deb-install --raw 某个包.deb        # 不走 pacman，直接解包铺到 /
 
 ---
 
-## 关于 WorkBuddy 技能文档
-
-`share/doc/SKILL.md` 是这个工具开发过程中积累的经验笔记，
-安装时会放到 `~/.workbuddy/skills/arch-install-deb/`。
-作用是在用 AI 助手处理 `.deb` 安装时，让它自动套用这些结论
-（比如"`pacman -F` 要批量调用否则极慢"、"`[ -t 0 ]` 在管道下会静默失效"）。
-不用 WorkBuddy 的话加 `--no-skill` 跳过，或者直接删掉那个目录。
-
----
-
 ## 仓库结构
 
 ```
