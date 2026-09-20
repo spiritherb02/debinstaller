@@ -1,12 +1,1503 @@
-#!/usr/bin/env python3
-"""Development entry point: run from a git checkout with ./bin/debinstall."""
+#!/usr/bin/env bash
+#
+# debinstall — 在 Arch Linux 上安装 Debian .deb 包
+#
+# 原理：把 .deb 的 data 树原样搬进一个真正的 Arch 包（.PKGINFO + .MTREE
+#       + .INSTALL），再交给 pacman -U 安装。因此装出来的东西被 pacman
+#       完整跟踪，可以用 pacman -R / -Ql / -Qk 正常管理。
+#
+# 依赖：dpkg(dpkg-deb) binutils(readelf) bsdtar fakeroot zstd pacman
+#
+# 作者：为 spiritherb 定制
 
-import os
-import sys
+set -uo pipefail
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+PROG=${0##*/}
+VERSION=2.1.0
+SHIMDIR=/usr/local/lib/debinstall/shims
+LOCALROOT=${DEBINSTALL_LOCAL_ROOT:-$HOME/.local/debinst}
 
-from debinstaller.cli import main  # noqa: E402
+MODE=analyze          # analyze | install | local | extract | convert | uninstall-local | list-local
+KEEP=0                # 保留生成的 Arch 包
+ASSUME_YES=0
+RUN_SCRIPTLETS=1
+OVERWRITE=0
+MAKE_DESKTOP=1        # 装完在桌面建快捷方式；--no-desktop 关闭（GUI 的复选框用它）
+ALLOW_DANGER=0        # 非交互模式下放行高危脚本，需显式 --allow-dangerous
+RUN_REMOVE_HOOKS=0    # 默认不在卸载时执行 .deb 的 prerm/postrm（见下方说明）
+COMPAT_LIBS=1         # 装完自动补齐 Debian 专属运行库并生成兼容启动器；--no-compat 关闭
+OUTDIR=
+EXTRACT_DIR=
+TARGET=
 
-if __name__ == "__main__":
-    sys.exit(main())
+# Debian 专属运行库的落地位置。Arch 仓库里没有的那些 soname（如
+# libnss_wrapper.so）从这里补，由生成的启动器通过 LD_LIBRARY_PATH 注入。
+COMPAT_DIR=${DEBINSTALL_COMPAT_DIR:-$HOME/.local/lib/debcompat}
+# 应用专属修复（如某个 Qt 版本要禁 GLX）写在 <app>.env 里，启动器会 source 它。
+# 这样「工具无法通用得知」的修法不会在重新生成启动器时被冲掉。
+COMPAT_ENV_DIR=${DEBINSTALL_COMPAT_ENV:-$HOME/.config/debinstall}
+
+DEB=            # .deb 路径
+WORK=           # 临时工作目录
+
+# ---------------------------------------------------------------- 输出
+# 注意：正常信息走 stdout。GUI（deb-install-ui）把 stderr 并进 stdout 读，
+# 若信息走 stderr 会因块缓冲而整体跑到末尾，行序全乱。只有真错误走 stderr。
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    CR=$'\e[31m'; CG=$'\e[32m'; CY=$'\e[33m'; CC=$'\e[36m'; CB=$'\e[1m'; CD=$'\e[2m'; C0=$'\e[0m'
+else
+    CR=; CG=; CY=; CC=; CB=; CD=; C0=
+fi
+info() { printf '%s==>%s %s\n' "${CB}${CC}" "$C0" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$CG" "$C0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$CY" "$C0" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$CR" "$C0" "$*"; }
+err()  { printf '%s==>%s %s\n' "${CB}${CR}" "$C0" "$*" >&2; }
+msg()  { printf '%s\n' "$*"; }
+die()  { err "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<'EOF'
+debinstall — 在 Arch Linux 上安装 Debian .deb 包
+
+用法：
+  debinstall [选项] <文件.deb>
+
+模式：
+  （默认）              只读分析（不动系统）：依赖、安装脚本审计、写入路径、冲突
+      --install         分析之后真正安装（转成 Arch 包交给 pacman）
+  -l, --local          解包安装到 ~/.local，不需要 root
+  -x, --extract <目录>  仅把 .deb 的数据树解包到指定目录
+  -c, --convert        只生成 Arch 包，不安装（输出到 --output 或当前目录）
+  -L, --list-local     列出用 --local 装过的包
+  -R, --remove-local <包名>
+                       卸载用 --local 装过的包
+
+选项：
+  -o, --output <目录>  -c 模式下 Arch 包的输出目录（默认当前目录）
+  -k, --keep           保留生成的 Arch 包（放到 --output 或当前目录）
+  -y, --yes            不再询问（--install 时默认要确认）
+      --overwrite      允许覆盖已存在的文件（pacman --overwrite，慎用）
+      --no-compat      不自动补 Debian 专属运行库、不生成兼容启动器
+      --no-scriptlet   不执行 .deb 自带的 postinst / prerm 等脚本
+      --allow-dangerous
+                       非交互模式下，明知脚本含高危操作仍要安装
+      --run-remove-hooks
+                       卸载时也执行 .deb 的 prerm / postrm（默认不执行）
+  -h, --help           显示本帮助
+  -v, --version        显示版本
+
+说明：
+  * 默认只做只读分析，看清楚再 --install。这是刻意设计的：.deb 自带的
+    postinst 是外来脚本，装之前应该先过一眼。
+  * 依赖优先从 .deb 内 ELF 的 NEEDED 声名中推导，再用 pacman 的文件数据库
+    反查真正的 Arch 包名，比按包名字面翻译准确得多。
+  * 安装走「转成真 Arch 包 + pacman -U」，装完被 pacman 完整跟踪，
+    可以用 pacman -R / -Ql / -Qo / -Qk 正常管理。
+  * 若 pacman 因文件冲突拒绝安装，改用 -l 装到用户目录（不需要 root），
+    或加 --overwrite 明确允许覆盖。
+  * 只发 .deb 的国产客户端常链接 Arch 没有的 Debian 专属库（libnss_wrapper.so
+    之类）。装完会自动从 Debian 官方源取这些库放到 ~/.local/lib/debcompat，
+    并生成兼容启动器 + 用户级桌面入口把 LD_LIBRARY_PATH 注入进去。
+    应用专属修复写 ~/.config/debinstall/<应用名>.env（重新生成不会被冲掉）。
+EOF
+}
+
+# ---------------------------------------------------------------- 参数
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install)         MODE=install ;;
+        -i|--info)         MODE=analyze ;;
+        -l|--local)        MODE=local ;;
+        -x|--extract)      MODE=extract; shift; EXTRACT_DIR=${1:-} ;;
+        -c|--convert)      MODE=convert ;;
+        -L|--list-local)   MODE=list-local ;;
+        -R|--remove-local) MODE=uninstall-local; shift; TARGET=${1:-} ;;
+        -o|--output)       shift; OUTDIR=${1:-} ;;
+        -k|--keep)         KEEP=1 ;;
+        -y|--yes)          ASSUME_YES=1 ;;
+    --overwrite)       OVERWRITE=1 ;;
+    --no-desktop)      MAKE_DESKTOP=0 ;;
+    --no-compat)       COMPAT_LIBS=0 ;;
+    --allow-dangerous) ALLOW_DANGER=1 ;;
+    --run-remove-hooks) RUN_REMOVE_HOOKS=1 ;;
+    --no-scriptlet)    RUN_SCRIPTLETS=0 ;;
+        -h|--help)         usage; exit 0 ;;
+        -v|--version)      echo "$PROG $VERSION"; exit 0 ;;
+        --)                shift; break ;;
+        -*)                die "未知选项：$1（用 -h 看帮助）" ;;
+        *)                 [ -z "$DEB" ] && DEB=$1 || die "只能处理一个 .deb 文件" ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] && { [ -z "$DEB" ] && DEB=$1; }
+
+case "$MODE" in
+    list-local)
+        [ -d "$LOCALROOT" ] || { info "还没有用 --local 装过任何包"; exit 0; }
+        printf '%-24s %-16s %s\n' "包名" "版本" "位置"
+        for d in "$LOCALROOT"/*/; do
+            [ -d "$d" ] || continue
+            n=$(basename "$d")
+            v=$(sed -n 's/^version=//p' "$d/.debinstall-info" 2>/dev/null | head -1)
+            printf '%-24s %-16s %s\n' "$n" "${v:--}" "${d%/}"
+        done
+        exit 0 ;;
+    uninstall-local)
+        [ -n "$TARGET" ] || die "请给出要卸载的包名：debinstall -R <包名>"
+        d="$LOCALROOT/$TARGET"
+        [ -d "$d" ] || die "没有找到 $d"
+        if [ -f "$d/.debinstall-manifest" ]; then
+            while IFS= read -r f; do
+                [ -n "$f" ] && [ -e "$f" ] && rm -f "$f"
+            done < "$d/.debinstall-manifest"
+        fi
+        rm -rf "$d"
+        have update-desktop-database && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1
+        ok "已卸载 $TARGET"
+        exit 0 ;;
+esac
+
+[ -n "$DEB" ] || { usage >&2; exit 1; }
+[ -f "$DEB" ] || die "找不到文件：$DEB"
+DEB=$(readlink -f "$DEB")
+
+for c in dpkg-deb bsdtar fakeroot zstd pacman; do
+    have "$c" || die "缺少 $c，请先安装（pacman -S dpkg binutils fakeroot zstd）"
+done
+
+cleanup() { [ -n "$WORK" ] && [ -d "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------- 提权
+SUDO=()
+detect_escalation() {
+    [ "$(id -u)" -eq 0 ] && { SUDO=(); return; }
+
+    # 终端里：正常问密码
+    if [ -t 0 ] && have sudo; then SUDO=(sudo); return; fi
+
+    # 图形界面（无控制终端）：优先用自带 GTK 密码框，凭据会缓存，不用反复输
+    if [ -z "${SUDO_ASKPASS:-}" ]; then
+        local _c
+        for _c in "$HOME/.local/bin/deb-install-askpass" /usr/bin/ksshaskpass; do
+            [ -x "$_c" ] && { SUDO_ASKPASS=$_c; export SUDO_ASKPASS; break; }
+        done
+    fi
+    if [ -n "${SUDO_ASKPASS:-}" ] && [ -x "$SUDO_ASKPASS" ] && have sudo; then
+        SUDO=(sudo -A); return
+    fi
+
+    # 兜底：polkit 图形授权
+    if have pkexec && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+        SUDO=(pkexec); return
+    fi
+
+    have sudo && { SUDO=(sudo); return; }
+    die "需要 root 权限，但 sudo / pkexec 都不可用"
+}
+run_root() {
+    if [ ${#SUDO[@]} -eq 0 ]; then "$@"; else "${SUDO[@]}" "$@"; fi
+}
+PACMAN=$(command -v pacman)
+
+# ---------------------------------------------------------------- 安全体检
+# .deb 自带的 postinst / prerm 是外来脚本，装下去就会以 root 执行。
+# 这里用正则过一遍，命中就停下来让人看清楚，绝不静默执行。
+DANGER=0
+DANGER_RE='rm[[:space:]]+-[a-zA-Z]*[rR][a-zA-Z]*[[:space:]]+(--[[:space:]]+)?/([[:space:]]|$)|rm[[:space:]]+-[rR][a-zA-Z]*[[:space:]]+-[a-zA-Z]*[[:space:]]+/([[:space:]]|$)|dd[[:space:]][^|]*of=/dev/|mkfs\.|>[[:space:]]*/dev/(sd|nvme|vd|mmcblk)|(curl|wget)[^|]*\|[[:space:]]*(ba|z|k)?sh|chown[[:space:]]+-R[[:space:]]+[^[:space:]]+[[:space:]]+/([[:space:]]|$)|chmod[[:space:]]+-R[[:space:]]+[0-7]*777[[:space:]]+/|:\(\)\{[[:space:]]*:\|:&'
+
+audit_scriptlets() {   # $1 = ctl 目录；命中高危则置 DANGER=1
+    local ctl=$1 f n=0
+    for f in preinst postinst prerm postrm; do
+        [ -s "$ctl/$f" ] || continue
+        n=$((n+1))
+        # 供 GUI 摘要卡片识别：preinst 12 行
+        printf '  %s %s 行\n' "$f" "$(wc -l < "$ctl/$f")"
+        if grep -qE "$DANGER_RE" "$ctl/$f"; then
+            DANGER=1
+            printf '  %s✗ 上面这个脚本含高危操作，装之前请人工确认！%s\n' "$CR" "$C0"
+            grep -nE "$DANGER_RE" "$ctl/$f" | sed 's/^/        /'
+        fi
+    done
+    [ $n -eq 0 ] && printf '  %s✓ 没有安装脚本（无 postinst 等）%s\n' "$CG" "$C0"
+    printf '      %s（Arch 上没有 dpkg，update-alternatives / AppArmor 这类逻辑多半会被跳过）%s\n' "$CD" "$C0"
+    if [ $RUN_REMOVE_HOOKS -eq 0 ]; then
+        printf '      %sprerm / postrm 在卸载时不会被执行（要执行加 --run-remove-hooks）%s\n' "$CD" "$C0"
+    else
+        printf '      %s! 已开启 --run-remove-hooks：卸载时 prerm / postrm 会以 root 执行%s\n' "$CY" "$C0"
+    fi
+    return 0
+}
+
+check_top_paths() {    # $1 = 解包后的根目录
+    local root=$1 unsafe
+    unsafe=$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null |
+             grep -vxE 'opt|usr|etc|var|lib|lib64|share|bin|sbin|run|tmp' || true)
+    [ -n "$unsafe" ] && warn "包含非常规顶层目录，请留意：$(echo $unsafe | tr '\n' ' ')"
+    printf '  %s写入的顶层路径：%s%s\n' "$CD" \
+        "$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f ' 2>/dev/null)" "$C0"
+    return 0
+}
+
+# desktop 文件里的 Exec 第一个 token 在当前系统上是否可执行。
+# 用来判断「用户级那份」和「包内这份」谁更可能是好的 —— 光看存在性不够：
+# 用户级那份可能是之前装坏留下的，包内这份也可能是带发行版检查的脚本。
+desktop_exec_ok() {   # $1 = .desktop 路径
+    local e
+    e=$(awk -F= '/^Exec=/{print $2; exit}' "$1" 2>/dev/null | awk '{print $1}')
+    [ -n "$e" ] || return 1
+    case "$e" in
+        /*) [ -x "$e" ] ;;
+        *)  have "$e" ;;
+    esac
+}
+
+check_desktop_shadow() {   # $1 = 解包后的根目录
+    local root=$1 d ud hit=0
+    [ -d "$root/usr/share/applications" ] || { ok "没有 desktop 遮蔽冲突（包内没有 .desktop）"; return 0; }
+    for d in "$root"/usr/share/applications/*.desktop; do
+        [ -f "$d" ] || continue
+        ud="$HOME/.local/share/applications/$(basename "$d")"
+        [ -e "$ud" ] || continue
+        hit=1
+        if cmp -s "$d" "$ud"; then
+            warn "$(basename "$d") 用户级与包内内容相同（用户级优先，装完效果一致）"
+            continue
+        fi
+        local uok=0 nok=0
+        desktop_exec_ok "$ud" && uok=1
+        desktop_exec_ok "$d"  && nok=1
+        warn "$(basename "$d") 用户级那份会遮蔽本次要装的同名文件，且内容不同"
+        if grep -q '^X-DebInstall-Wrapper=1' "$ud" 2>/dev/null; then
+            printf '        → %s用户级那份是本工具生成的兼容启动器入口，正常现象，保留即可%s\n' "$CG" "$C0"
+            printf '          （它负责注入 LD_LIBRARY_PATH，删掉会让应用起不来）\n'
+        elif [ $uok -eq 1 ] && [ $nok -eq 0 ]; then
+            printf '        → 用户级的 Exec 可用、包内这份不可用：%s保留用户级，不要 mv 走%s\n' "$CG" "$C0"
+        elif [ $uok -eq 0 ] && [ $nok -eq 1 ]; then
+            printf '        → 用户级的 Exec 不可用（多半是上次装坏留下的），包内这份可用\n'
+            printf '          删掉坏的那份让新的生效：mv %s{,.bak}\n' "$ud"
+        elif [ $uok -eq 0 ] && [ $nok -eq 0 ]; then
+            printf '        → 两份的 Exec 都不可用，先确认主程序路径再决定\n'
+            printf '          对比：grep ^Exec= %s %s\n' "$ud" "$d"
+        else
+            printf '        → 两份都可用，用户级那份像是你自定义过的\n'
+            printf '          想用新装的这份：mv %s{,.bak}\n' "$ud"
+        fi
+    done
+    [ $hit -eq 0 ] && ok "没有 desktop 遮蔽冲突"
+    return 0
+}
+
+check_ll_cli() {           # $1 = 包名
+    have ll-cli || return 0
+    if XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} ll-cli list 2>/dev/null | grep -qi "$1"; then
+        warn "玲珑里已装了类似的应用，注意单实例锁会互相顶掉"
+    fi
+    return 0
+}
+
+# 从 .deb 里列出它会装的桌面入口
+deb_desktop_files() {
+    dpkg-deb -c "$DEB" 2>/dev/null | awk '{print $NF}' | sed 's|^\./||' \
+        | grep -E '^usr/share/applications/[^/]+\.desktop$'
+}
+
+# 在桌面放快捷方式：名字优先取 Name[zh_CN]，回退 Name，再回退文件名。
+# $1 = 桌面入口所在目录（系统安装是 /usr/share/applications，
+#      本地安装是 ~/.local/share/applications —— 后者路径已被改写，必须用哪份取哪份）
+make_desktop_shortcut() {
+    local srcdir=${1:-/usr/share/applications}
+    local ddir rel src label dest made=0
+    ddir=$(xdg-user-dir DESKTOP 2>/dev/null)
+    [ -n "$ddir" ] || ddir="$HOME/Desktop"
+    if [ ! -d "$ddir" ]; then
+        warn "桌面目录不存在，跳过：$ddir"
+        return 0
+    fi
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        src="$srcdir/$(basename "$rel")"
+        [ -f "$src" ] || continue
+        # 补库生成过带 wrapper 标记的用户级版本 → 桌面那份要用它，
+        # 否则桌面图标仍指向没注入 LD_LIBRARY_PATH 的原始 Exec。
+        local uw="$HOME/.local/share/applications/$(basename "$rel")"
+        if [ -f "$uw" ] && grep -q '^X-DebInstall-Wrapper=1' "$uw" 2>/dev/null; then
+            src="$uw"
+        fi
+        label=$(awk -F= '/^Name\[zh_CN\]=/{print $2; exit}' "$src")
+        [ -n "$label" ] || label=$(awk -F= '/^Name=/{print $2; exit}' "$src")
+        [ -n "$label" ] || label=$(basename "$rel" .desktop)
+        dest="$ddir/$label.desktop"
+        # 桌面快捷方式是「用户自己的东西」：内容一样就不动，不一样先备份再覆盖。
+        # 之前是无条件 cp -f，用户改过的 Exec（比如指向自己写的兼容启动器）
+        # 会被静默冲掉，重新装一次就退回到坏的状态。
+        if [ -e "$dest" ]; then
+            if cmp -s "$src" "$dest"; then
+                ok "桌面快捷方式已是最新 → $dest"
+                made=1
+                continue
+            fi
+            local bak="$dest.bak-$(date +%Y%m%d-%H%M%S)"
+            cp -f "$dest" "$bak" && warn "原桌面快捷方式已备份 → $bak"
+        fi
+        if cp -f "$src" "$dest" && chmod +x "$dest"; then
+            ok "桌面快捷方式 → $dest"
+            made=1
+        fi
+    done < <(deb_desktop_files)
+    [ "$made" -eq 0 ] && warn "这个包里没有 .desktop，跳过桌面快捷方式"
+    return 0
+}
+
+# ---------------------------------------------------------------- alternatives 模拟
+# SHIMDIR 里的 update-alternatives shim（base64 内嵌，避免转义问题）
+_ALT_SHIM_B64="IyEvYmluL3NoCiMgdXBkYXRlLWFsdGVybmF0aXZlcyBzaGltIOKAlOKAlCDnlLEgZGViaW5zdGFsbCDnlJ/miJDvvIzku4XkvpsgLmRlYiDnmoTnu7TmiqTohJrmnKzkvb/nlKjjgIIKIwojIEFyY2gg5LiK5rKh5pyJIHVwZGF0ZS1hbHRlcm5hdGl2ZXPjgIJEZWJpYW4g5YyF5bi46Z2g5a6D5oqKIC91c3IvYmluL2ZpZ2xldCDov5nnsbsKIyDjgIzpgJrnlKjlkb3ku6TlkI3jgI3mjIflkJHnnJ/mraPluKblkI7nvIDnmoTlj6/miafooYzmlofku7bvvIjlpoIgZmlnbGV0LXV0ZjjvvInvvIwKIyDnvLrkuoblroPlsLHlj6rliakgZmlnbGV0LXV0ZjjvvIznlKjmiLfmlbIgZmlnbGV0IOS8muaJvuS4jeWIsOWRveS7pOOAggojCiMg5Y+q5YGa5Lik5Lu25LqL77yaLS1pbnN0YWxsIOW7uumTvuOAgS0tcmVtb3ZlIOWIoOmTvuOAggojIOWFtuS9meWtkOWRveS7pO+8iC0tZGlzcGxheS8tLWNvbmZpZy8tLWxpc3QvLS1xdWVyeS8tLXNldC8tLWdldC1zZWxlY3Rpb25z4oCm77yJCiMg5LiA5b6L6Z2Z6buY5oiQ5Yqf77yM5YWN5b6XIHBvc3RpbnN0IOWboOS4uuOAjOWRveS7pOS4jeWtmOWcqOOAjeiAjOS4reaWreaVtOS4quWuieijheOAggoKQUxUX0RCPSIke0RFQklOU1RBTExfQUxUX0RCOi0vdmFyL2xpYi9kZWJpbnN0YWxsL2FsdGVybmF0aXZlc30iCm1rZGlyIC1wICIkQUxUX0RCIiAyPi9kZXYvbnVsbCB8fCBBTFRfREI9Ii90bXAiCgojIOWPsOi0puavj+ihjO+8miDlkI0gPFRBQj4g6ZO+5o6lIDxUQUI+IOebruaghwpfbG9nKCkgeyAgICMgJDE95ZCNICAkMj3pk77mjqUgICQzPeebruaghwogICAgcHJpbnRmICclc1x0JXNcdCVzXG4nICIkMSIgIiQyIiAiJDMiID4+ICIkQUxUX0RCL2xpbmtzIiAyPi9kZXYvbnVsbAp9CgojIOazqOaEj++8muS4jeimgeeUqOOAjOWHveaVsOmHjCBzaGlmdOOAjeadpeWBmuWPguaVsOWJjeenuyDigJTigJQgUE9TSVggc2gg6YeM5Ye95pWw5YaF55qEIHNoaWZ0CiMg5Y+q5Yqo5Ye95pWw6Ieq5bex55qE5L2N572u5Y+C5pWw77yM5pS55LiN5LqG6LCD55So5pa555qEICRA44CCCiMg5omA5Lul5LiA5b6L5YaF6IGU5oiQIGBbICQjIC1ndCAwIF0gJiYgc2hpZnRg77yM5pei5YmN56e75Y+I5LiN5Lya5Zyo5Y+C5pWw5LiN6Laz5pe25oql6ZSZ44CCCgojIOW7uumTvu+8miQxPemTvuaOpSAgJDI955uu5qCHICAkMz3lkI0KX21rKCkgewogICAgWyAtbiAiJDEiIF0gJiYgWyAtbiAiJDIiIF0gfHwgcmV0dXJuIDAKICAgIFsgLWUgIiQyIiBdIHx8IHJldHVybiAwCiAgICBbIC1kICIkKGRpcm5hbWUgIiQxIikiIF0gfHwgbWtkaXIgLXAgIiQoZGlybmFtZSAiJDEiKSIgMj4vZGV2L251bGwKICAgIGlmIGxuIC1zZm4gIiQyIiAiJDEiIDI+L2Rldi9udWxsOyB0aGVuCiAgICAgICAgX2xvZyAiJDMiICIkMSIgIiQyIgogICAgZmkKICAgIHJldHVybiAwCn0KCm9wPSR7MTotfQpbICQjIC1ndCAwIF0gJiYgc2hpZnQKCmNhc2UgIiRvcCIgaW4KICAgIC0taW5zdGFsbCkKICAgICAgICBsaW5rPSR7MTotfTsgICBbICQjIC1ndCAwIF0gJiYgc2hpZnQKICAgICAgICBuYW1lPSR7MTotfTsgICBbICQjIC1ndCAwIF0gJiYgc2hpZnQKICAgICAgICB0YXJnZXQ9JHsxOi19OyBbICQjIC1ndCAwIF0gJiYgc2hpZnQKICAgICAgICBfbWsgIiRsaW5rIiAiJHRhcmdldCIgIiRuYW1lIgogICAgICAgICMg5ZCO6Z2i5Y+v6IO96Lef6Iul5bmyIC0tc2xhdmUgPOmTvuaOpT4gPOWQjT4gPOebruaghz4g57uECiAgICAgICAgd2hpbGUgWyAkIyAtZ3QgMCBdOyBkbwogICAgICAgICAgICBjYXNlICIkMSIgaW4KICAgICAgICAgICAgICAgIC0tc2xhdmUpCiAgICAgICAgICAgICAgICAgICAgc2hpZnQKICAgICAgICAgICAgICAgICAgICBzbD0kezE6LX07IFsgJCMgLWd0IDAgXSAmJiBzaGlmdAogICAgICAgICAgICAgICAgICAgIHNuPSR7MTotfTsgWyAkIyAtZ3QgMCBdICYmIHNoaWZ0CiAgICAgICAgICAgICAgICAgICAgc3A9JHsxOi19OyBbICQjIC1ndCAwIF0gJiYgc2hpZnQKICAgICAgICAgICAgICAgICAgICBfbWsgIiRzbCIgIiRzcCIgIiRzbiIKICAgICAgICAgICAgICAgICAgICA7OwogICAgICAgICAgICAgICAgKikgc2hpZnQgOzsKICAgICAgICAgICAgZXNhYwogICAgICAgIGRvbmUKICAgICAgICA7OwogICAgLS1yZW1vdmUpCiAgICAgICAgX25hbWU9JHsxOi19OyBbICQjIC1ndCAwIF0gJiYgc2hpZnQKICAgICAgICBfdD0kezE6LX0KICAgICAgICBpZiBbIC1uICIkX3QiIF0gJiYgWyAtZiAiJEFMVF9EQi9saW5rcyIgXTsgdGhlbgogICAgICAgICAgICAjIOWIoOaOieaMh+WQkeivpeebruagh+eahOmTvuaOpe+8iOazqOaEj+esrCAyIOS4quWtl+auteaJjeaYr+mTvuaOpei3r+W+hO+8iQogICAgICAgICAgICB3aGlsZSBJRlM9IiQocHJpbnRmICdcdCcpIiByZWFkIC1yIF9uIF9sIF9wOyBkbwogICAgICAgICAgICAgICAgWyAiJF9wIiA9ICIkX3QiIF0gfHwgY29udGludWUKICAgICAgICAgICAgICAgIFsgLW4gIiRfbCIgXSAmJiBbIC1MICIkX2wiIF0gJiYgcm0gLWYgIiRfbCIgMj4vZGV2L251bGwKICAgICAgICAgICAgZG9uZSA8ICIkQUxUX0RCL2xpbmtzIgogICAgICAgICAgICAjIOa4heWPsOi0puOAguazqOaEj+WIq+WGmeaIkCBgZ3JlcCAtdkYgLi4uID4gdG1wICYmIG12YO+8mgogICAgICAgICAgICAjIOWFqOmDqOihjOmDveiiq+i/h+a7pOaOieaXtiBncmVwIOi/lOWbniAx77yMJiYg5ZCO6Z2i55qEIG12IOWwseS4jeS8muaJp+ihjO+8jAogICAgICAgICAgICAjIOe7k+aenOmTvuaOpeWIoOS6huOAgeWPsOi0pui/mOWcqOOAggogICAgICAgICAgICBpZiBncmVwIC12RiAiJF90IiAiJEFMVF9EQi9saW5rcyIgPiAiJEFMVF9EQi9saW5rcy50bXAiIDI+L2Rldi9udWxsOyB0aGVuCiAgICAgICAgICAgICAgICBtdiAtZiAiJEFMVF9EQi9saW5rcy50bXAiICIkQUxUX0RCL2xpbmtzIiAyPi9kZXYvbnVsbAogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICA6ID4gIiRBTFRfREIvbGlua3MiIDI+L2Rldi9udWxsCiAgICAgICAgICAgICAgICBybSAtZiAiJEFMVF9EQi9saW5rcy50bXAiIDI+L2Rldi9udWxsCiAgICAgICAgICAgIGZpCiAgICAgICAgZmkKICAgICAgICA7OwogICAgKikKICAgICAgICA6IDs7ICAgIyDlhbbkvZnlrZDlkb3ku6TvvIjlkKvnqbrlj4LmlbDvvInpnZnpu5jot7Pov4cKZXNhYwoKZXhpdCAwCg=="
+
+# 把 shim 落到指定目录；$1 = 目录，$2 = 可选前缀命令（如 run_root）
+write_shim() {
+    local dir=$1; shift
+    if [ -x "$dir/update-alternatives" ]; then return 0; fi
+    "$@" mkdir -p "$dir" 2>/dev/null || return 1
+    printf '%s' "$_ALT_SHIM_B64" | base64 -d \
+        | "$@" tee "$dir/update-alternatives" >/dev/null 2>&1 || return 1
+    "$@" chmod 755 "$dir/update-alternatives" 2>/dev/null
+    return 0
+}
+
+# 本地模式下模拟 update-alternatives。
+# 本地安装不会执行 .deb 的 postinst，所以「命令名靠 alternatives 生成」的包
+# （最典型就是 figlet：包里只有 figlet-utf8，/usr/bin/figlet 是链接出来的）
+# 装完会少掉那个通用命令名。这里直接扫 postinst 里的 --install 调用补上。
+emulate_alternatives_local() {   # $1=本地根 $2=ctl 目录 $3=manifest
+    local dest=$1 ctl=$2 man=$3 f made=0
+    for f in preinst postinst; do
+        [ -s "$ctl/$f" ] || continue
+        while IFS="$(printf '\t')" read -r link target; do
+            [ -n "$link" ] && [ -n "$target" ] || continue
+            local rel="${target}"
+            case "$rel" in
+                /usr/*|/opt/*) : ;;
+                *) continue ;;                     # 相对路径不可靠，跳过
+            esac
+            local real="$dest$rel"
+            [ -e "$real" ] || continue
+            local base; base=$(basename "$link")
+            local where="$HOME/.local/bin/$base"
+            [ -e "$where" ] && [ ! -L "$where" ] && continue    # 别覆盖真程序
+            if ln -sfn "$real" "$where" 2>/dev/null; then
+                ok "命令别名 $base → $rel（模拟 update-alternatives）"
+                [ -n "$man" ] && echo "$where" >> "$man"
+                made=1
+            fi
+        done < <(awk '
+            { buf = buf " " $0 }
+            END {
+                # 先按空白切，再滤掉空串和续行反斜杠，
+                # 这样后三个位置才是稳定的「链接 / 名 / 目标」。
+                n0 = split(buf, raw, /[ \t]+/)
+                m = 0
+                for (i = 1; i <= n0; i++) {
+                    if (raw[i] == "" || raw[i] == "\\") continue
+                    m++; c[m] = raw[i]
+                }
+                for (i = 1; i <= m; i++) {
+                    if (c[i] == "--install" && c[i-1] ~ /update-alternatives/) {
+                        if (c[i+1] != "" && c[i+3] != "") print c[i+1] "\t" c[i+3]
+                    }
+                }
+            }
+        ' "$ctl/$f")
+    done
+    return 0
+}
+
+fix_electron() {           # 装完扫 chrome-sandbox，顺手修权限
+    local sb
+    sb=$(find /opt /usr/lib -maxdepth 4 -name chrome-sandbox -newermt '-3 minutes' 2>/dev/null | head -1)
+    [ -n "$sb" ] || return 0
+    # Linux 6.x 内核下非特权 user namespace 可用就不需要 SUID，留 0755 更安全
+    if [ -e /proc/sys/kernel/unprivileged_userns_clone ] &&
+       [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" = "0" ]; then
+        run_root chmod 4755 "$sb" && ok "chrome-sandbox → 4755（SUID，本机禁用了 user namespace）"
+    elif unshare --user true 2>/dev/null; then
+        run_root chmod 0755 "$sb" && ok "chrome-sandbox → 0755（user namespace 可用，无需 SUID）"
+    else
+        run_root chmod 4755 "$sb" && ok "chrome-sandbox → 4755（SUID 回退）"
+    fi
+    return 0
+}
+
+# ================================================================ Debian 补库
+# 有些只发 .deb 的国产客户端（网易邮箱大师是典型）会链接 Arch 仓库里根本
+# 不存在的 soname。实测两类：
+#   1) Debian 专属库      如 libnss_wrapper.so —— Arch 全仓库（含 archlinuxcn）
+#                         都没有，pacman -F 查不到，只能从 Debian 取；
+#   2) 旧 soname          如 libsasl2.so.2 —— Arch 的 libsasl 只给 .so.3。
+#                         这类 Debian 也有对应包（libsasl2-2），直接取更干净。
+#
+# 所以策略统一为「去 Debian 取」：soname → Debian 包名（查官方 Contents 索引）
+# → .deb 直链（查官方 download 页）→ 解包抽出 usr/lib/ 下的 .so* → 落到
+# $COMPAT_DIR。取回来的库若自身还缺依赖，会继续补（最多 3 轮）。
+#
+# 配套生成一个用户级启动器，把 LD_LIBRARY_PATH 注入进去 —— 因为往 /usr/lib
+# 塞库需要 root 且会污染系统，而改 /opt 里的文件会被 pacman 升级冲掉。
+# 启动器 + 用户级 .desktop 的整套思路见 SKILL.md「兼容启动器」一节。
+
+http_get() {   # $1 = url；回显响应体
+    local u=$1
+    if have curl; then
+        curl -fsSL --max-time 45 -A "debinstall/$VERSION (Arch Linux deb converter)" "$u" 2>/dev/null
+    elif have wget; then
+        wget -qO- --timeout=45 --user-agent="debinstall/$VERSION" "$u" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# 从 Contents 索引查某个 soname 由哪个 Debian 二进制包提供。
+# 回显 "<suite> <包名>"；查不到返回 1。
+debian_pkg_for_soname() {
+    local so=$1 html suite pkg
+    html=$(http_get "https://packages.debian.org/search?searchon=contents&keywords=${so}&mode=exactfilename&suite=stable&arch=amd64") || return 1
+    [ -n "$html" ] || return 1
+    # 结果都在唯一那张 <table> 里，每行形如：
+    #   <td class="file">/usr/lib/x86_64-linux-gnu/...xxx.so</td> <td><a href="/trixie/pkg">pkg</a></td>
+    # 先压平行、再只保留表格段，避免把导航链接（全是单段路径）算进来。
+    pkg=$(printf '%s' "$html" | tr '\n' ' ' \
+          | sed -n 's|.*<table>\(.*\)</table>.*|\1|p' \
+          | grep -oE 'href="/[a-z0-9-]+/[A-Za-z0-9][A-Za-z0-9._+-]*"' \
+          | sed -e 's|href="/||' -e 's|"$||' | awk -F/ '!seen[$2]++{print; exit}')
+    [ -n "$pkg" ] || return 1
+    suite=${pkg%%/*}; pkg=${pkg#*/}
+    printf '%s %s\n' "$suite" "$pkg"
+}
+
+# Debian 包名 → .deb 的官方 CDN 直链。download 页列的是各镜像的绝对 URL，
+# 从中剥出 pool/... 相对路径，再统一挂到 deb.debian.org 上（最稳的官方入口）。
+# 注意别用「去掉 http://host/ 前缀」的写法：镜像 URL 形如
+#   http://ftp.at.debian.org/debian/pool/main/n/nss-wrapper/xxx.deb
+# 去掉 host 后还留着发行版名 debian/，再拼 deb.debian.org/debian/ 就重复了。
+debian_deb_url() {   # $1 = 包名, $2 = suite
+    local html rel
+    html=$(http_get "https://packages.debian.org/$2/amd64/$1/download") || return 1
+    [ -n "$html" ] || return 1
+    rel=$(printf '%s' "$html" | grep -oE 'pool/[^"]*_amd64\.deb' | head -1)
+    # 少数包只有 all 架构（纯数据/脚本）
+    [ -n "$rel" ] || rel=$(printf '%s' "$html" | grep -oE 'pool/[^"]*_all\.deb' | head -1)
+    [ -n "$rel" ] || return 1
+    printf 'https://deb.debian.org/debian/%s\n' "$rel"
+}
+
+# 逐个 lib 目录地扫一个已解包树，回显它缺的 soname（一行一个）
+missing_sonames() {   # $1 = 已解包的根目录；$2.. = 额外要一起看的目录（如 COMPAT_DIR）
+    local shipped need resolved s pkg d extra=""
+    local roots=("$@")
+    shipped=$(shipped_sonames "$1")
+    # $2.. 里已补进来的库也算 shipped，否则第二轮会把刚补上的库再当成缺失
+    for d in "${roots[@]:1}"; do
+        [ -d "$d" ] && extra="$extra$(shipped_sonames "$d")"$'\n'
+    done
+    need=""
+    for d in "${roots[@]}"; do
+        [ -d "$d" ] || continue
+        need="$need$(elf_sonames "$d")"$'\n'
+    done
+    need=$(printf '%s\n' "$need" | grep -v '^$' | sort -u)
+    shipped=$(printf '%s\n%s\n' "$shipped" "$extra" | grep -v '^$' | sort -u)
+    need=$(printf '%s\n' "$need" | grep -vxF "$shipped" 2>/dev/null || true)
+    resolved=$(printf '%s\n' "$need" | resolve_sonames)
+    for s in $need; do
+        pkg=$(awk -F'\t' -v k="$s" '$1==k{print $2; exit}' <<<"$resolved")
+        [ -z "$pkg" ] && printf '%s\n' "$s"
+    done
+}
+
+# 下载一个 Debian 包，把里面的 .so* 抽到 $COMPAT_DIR。回显补进来的文件名。
+fetch_debian_libs() {   # $1 = Debian 包名, $2 = suite
+    local pkg=$1 suite=$2 url tmp rc=0
+    url=$(debian_deb_url "$pkg" "$suite") || return 1
+    tmp=$(mktemp -d) || return 1
+    if ! http_get "$url" > "$tmp/p.deb" 2>/dev/null || [ ! -s "$tmp/p.deb" ]; then
+        rm -rf "$tmp"; return 1
+    fi
+    mkdir -p "$tmp/x"
+    dpkg-deb -x "$tmp/p.deb" "$tmp/x" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    mkdir -p "$COMPAT_DIR"
+    # 保留 usr/lib/... 下的相对层级没有意义（loader 不递归），全部平铺到
+    # COMPAT_DIR；符号链接跟着一起复制，否则只有 soname 里的 .so.N 没有实体名。
+    while IFS= read -r -d '' f; do
+        cp -a "$f" "$COMPAT_DIR/" 2>/dev/null || rc=1
+    done < <(find "$tmp/x" \( -path '*/usr/lib/*' -o -path '*/lib/*' \) \
+                  \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null)
+    rm -rf "$tmp"
+    return $rc
+}
+
+# 主流程：把当前包缺的库尽量补齐。$1 = 已解包的 .deb 根目录
+setup_compat_libs() {
+    local root=$1 round s pkg suite added=0 failed="" needs_wrapper=0
+    local -a todo
+    info "检查 Debian 专属运行库"
+
+    # 这个应用是否**依赖** debcompat 里的库？判断方式是「不把 COMPAT_DIR 算作
+    # 已满足」再问一次。这一步不能省：第二次安装时库早就在 COMPAT_DIR 里了，
+    # 不需要再下载，但启动器仍然必须存在且接线正确 —— 用户可能删过它，
+    # 或者 /opt 刚被 pacman 覆盖过。只看「这轮要不要下东西」会漏掉这种情况，
+    # 表现为「第一次装好好的，重装一次图标就失灵」。
+    local -a bare
+    mapfile -t bare < <(missing_sonames "$root")
+    [ ${#bare[@]} -gt 0 ] && needs_wrapper=1
+
+    for round in 1 2 3; do
+        # 每轮都重扫：上一轮补进来的库可能又引出新的缺失
+        mapfile -t todo < <(missing_sonames "$root" "$COMPAT_DIR")
+        if [ ${#todo[@]} -eq 0 ]; then
+            [ $round -eq 1 ] && ok "依赖完整，无需补库"
+            break
+        fi
+        [ $round -eq 1 ] && printf '  %s!%s 缺 %d 个 Arch 仓库不提供的库，尝试从 Debian 补齐：%s\n' \
+            "$CY" "$C0" "${#todo[@]}" "${todo[*]}"
+        local progressed=0
+        for s in "${todo[@]}"; do
+            read -r suite pkg < <(debian_pkg_for_soname "$s") || true
+            if [ -z "${pkg:-}" ]; then
+                printf '    %-28s → %s未在 Debian 找到%s\n' "$s" "$CY" "$C0"
+                failed="$failed$s "; continue
+            fi
+            if fetch_debian_libs "$pkg" "$suite"; then
+                printf '    %-28s → %s ← Debian %s\n' "$s" "$pkg" "$pkg"
+                added=1; progressed=1
+            else
+                printf '    %-28s → %s下载失败（Debian %s）%s\n' "$s" "$CR" "$pkg" "$C0"
+                failed="$failed$s "
+            fi
+        done
+        [ $progressed -eq 0 ] && break
+    done
+
+    if [ $added -eq 1 ]; then
+        ok "兼容库已就位：$COMPAT_DIR"
+        mapfile -t todo < <(missing_sonames "$root" "$COMPAT_DIR")
+        [ ${#todo[@]} -gt 0 ] && warn "仍有未解析的库：${todo[*]}"
+    elif [ -n "$failed" ]; then
+        warn "以下库没能补上，应用可能起不来：$failed"
+    fi
+
+    # 只要这个应用依赖 debcompat，就保证启动器 + 用户级桌面入口在位。
+    # 放在最后统一处理，避免「无需下载」这条路径漏掉接线。
+    [ $needs_wrapper -eq 1 ] && make_compat_wrapper "$root"
+    return 0
+}
+
+# 从包内的 .desktop 里找主程序，生成用户级启动器 + 用户级 .desktop。
+# 为什么必须生成启动器：LD_LIBRARY_PATH 得有人注入，而：
+#   * 改 /opt 里的文件 → 会被 pacman 升级覆盖，且不在包清单里
+#   * 往 /usr/lib 塞库   → 需要 root 且污染系统
+#   * 用户级 .desktop 优先于 /usr/share/applications，正好用来挂启动器
+make_compat_wrapper() {
+    local root=$1 d appdir exec_cmd bin title srcname dest
+
+    d=$(find "$root/usr/share/applications" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -1)
+    [ -n "$d" ] || { warn "包内没有 .desktop，跳过启动器生成"; return 0; }
+    exec_cmd=$(awk -F= '/^Exec=/{print $2; exit}' "$d" | awk '{print $1}')
+    [ -n "$exec_cmd" ] || { warn ".desktop 里没有 Exec，跳过启动器生成"; return 0; }
+
+    # Exec 常常是包一层的 launch.sh / start.sh —— 这类脚本里常有发行版检查
+    # （网易邮箱大师就是被 launch.sh 里的 lsb_release 判断拦下的），直接 exec
+    # 它等于没绕开。所以遇到 *launch*.sh / *start*.sh / *run*.sh 就在同目录里
+    # 找一个同名的真身二进制。
+    bin=$exec_cmd
+    case "$(basename "$exec_cmd")" in
+        launch.sh|start.sh|run.sh|*.sh)
+            appdir=$(dirname "$exec_cmd")
+            local cand want1 want2
+            want1=$(basename "$appdir")            # /opt/mailmaster → mailmaster
+            want2=$(basename "$d" .desktop)        # mailmaster.desktop → mailmaster
+            for cand in "$appdir/$want1" "$appdir/$want2"; do
+                if [ -f "$cand" ] && [ -x "$cand" ]; then bin=$cand; break; fi
+            done
+            if [ "$bin" = "$exec_cmd" ]; then
+                warn "没能从 $(basename "$exec_cmd") 里认出真身二进制，仍指向它"
+                warn "  若该脚本含发行版检查（lsb_release 之类），请在 $COMPAT_ENV_DIR 下另行处理"
+            fi
+            ;;
+    esac
+
+    srcname=$(basename "$d" .desktop)          # 如 mailmaster
+    title=$(awk -F= '/^Name=/{print $2; exit}' "$d")
+    [ -n "$title" ] || title=$srcname
+
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$COMPAT_ENV_DIR"
+    dest="$HOME/.local/bin/$srcname"
+
+    # 已存在同名启动器 → 不是本工具生成的就先备份，别把用户自己的东西冲掉
+    if [ -e "$dest" ] && ! grep -q 'debinstall 兼容启动器' "$dest" 2>/dev/null; then
+        cp -f "$dest" "$dest.bak-$(date +%Y%m%d-%H%M%S)"
+        warn "$dest 已存在且不是本工具生成的，原文件已备份"
+    fi
+
+    cat > "$dest" <<WRAPPER
+#!/bin/bash
+# debinstall 兼容启动器 —— 自动生成，可手动编辑；重新生成会保留本文件里的改动
+# 之外的部分（应用专属修复请写进 $COMPAT_ENV_DIR/$srcname.env）
+APP_DIR="${bin%/*}"
+COMPAT_DIR="$COMPAT_DIR"
+
+export LD_LIBRARY_PATH="\$COMPAT_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+# 应用专属修复（不被重新生成冲掉）
+[ -f "$COMPAT_ENV_DIR/$srcname.env" ] && . "$COMPAT_ENV_DIR/$srcname.env"
+
+cd "\$APP_DIR" 2>/dev/null || true
+exec "$bin" "\$@"
+WRAPPER
+    chmod +x "$dest"
+    ok "兼容启动器 → $dest"
+
+    # 用户级 .desktop：优先于 /usr/share/applications 里的同名文件
+    local ud="$HOME/.local/share/applications/$srcname.desktop"
+    if [ -e "$ud" ] && ! grep -q 'X-DebInstall-Wrapper=1' "$ud" 2>/dev/null; then
+        cp -f "$ud" "$ud.bak-$(date +%Y%m%d-%H%M%S)"
+        warn "$ud 已存在且不是本工具生成的，原文件已备份"
+    fi
+    awk -v ex="$dest %U" '
+        /^Exec=/   { print "Exec=" ex; next }
+        /^TryExec=/ { next }
+        { print }
+    ' "$d" > "$ud.tmp"
+    grep -q '^X-DebInstall-Wrapper=' "$ud.tmp" || \
+        printf 'X-DebInstall-Wrapper=1\n' >> "$ud.tmp"
+    mv -f "$ud.tmp" "$ud"
+    have update-desktop-database && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1
+    ok "用户级桌面入口 → $ud（已指向启动器）"
+
+    # 生成一个空的 env 文件当模板，让用户知道去哪儿加应用专属修复
+    local envf="$COMPAT_ENV_DIR/$srcname.env"
+    if [ ! -e "$envf" ]; then
+        cat > "$envf" <<'ENVEOF'
+# debinstall 应用专属修复。这里的 export 会在启动器里生效，
+# 且重新生成启动器时不会被冲掉。例如：
+#   export QT_XCB_GL_INTEGRATION=none    # 自带 Qt5 的 GLX 在 Mesa 上段错误
+#   export QT_QPA_PLATFORM=xcb
+ENVEOF
+        ok "应用专属修复模板 → $envf"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- 元数据
+field() { dpkg-deb --field "$DEB" "$1" 2>/dev/null | head -1 || true; }
+
+split_version() {   # $1 = Debian 版本号 → 回显 "pkgver pkgrel"
+    local v=$1 up rev
+    v=${v//[[:space:]]/}
+    v=${v#*:}                       # 丢掉 epoch
+    if [ "${v#*-}" != "$v" ]; then  # 有 Debian revision
+        rev=${v##*-}; up=${v%-*}
+    else
+        rev=1; up=$v
+    fi
+    # Arch 的 pkgver 不能含 - 和 :，其余非法字符统一换成 .
+    up=$(printf '%s' "$up" | tr -c 'A-Za-z0-9._+' '.')
+    up=${up#.}; up=${up%.}
+    [ -n "$up" ] || up=1
+    rev=$(printf '%s' "$rev" | tr -c 'A-Za-z0-9.' '.')
+    rev=${rev#.}; rev=${rev%.}
+    [ -n "$rev" ] || rev=1
+    printf '%s %s\n' "$up" "$rev"
+}
+
+map_arch() {
+    case "${1,,}" in
+        amd64|x86_64)  echo x86_64 ;;
+        arm64|aarch64) echo aarch64 ;;
+        i386|i486|i586|i686) echo i686 ;;
+        armhf|armv7l)  echo armv7h ;;
+        all|any|noarch) echo any ;;
+        *) echo "${1,,}" ;;
+    esac
+}
+
+sanitize_name() {
+    printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9@._+-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+# ---------------------------------------------------------------- 依赖推导
+# 收集目录下所有 ELF 的 DT_NEEDED 声名
+elf_sonames() {
+    local d=$1 f magic
+    find "$d" -type f \( -perm -u+x -o -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null |
+    while IFS= read -r -d '' f; do
+        [ -L "$f" ] && continue
+        magic=$(head -c 4 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+        [ "$magic" = "7f454c46" ] || continue
+        readelf -d "$f" 2>/dev/null | sed -n 's/.*(NEEDED)[^[]*\[\(.*\)\]/\1/p'
+    done | sort -u
+}
+
+# 包自己带的 soname（不需要外部依赖）
+shipped_sonames() {
+    find "$1" \( -name '*.so' -o -name '*.so.*' \) -printf '%f\n' 2>/dev/null | sort -u
+}
+
+# soname → Arch 包名。用 pacman 文件数据库反查，优先 core > extra > multilib，
+# 排除 lib32-*（除非目标就是 32 位包）与第三方仓库。
+# 只认真正的库目录 usr/lib*/，避免把 aarch64/riscv64 交叉工具链里的同名库算进来。
+#
+# 【性能】逐个 soname 调一次 pacman -F 很慢（实测 4 个库 33.7s），
+# 批量一次调用只要 9.2s（14 个库 ~30s）。所以这里走批量：
+#   stdin  = soname 列表（一行一个）
+#   stdout = "soname<TAB>包名"
+resolve_sonames() {
+    local -a list=()
+    local s
+    while IFS= read -r s; do
+        [ -n "$s" ] && list+=("$s")
+    done
+    [ ${#list[@]} -eq 0 ] && return 0
+
+    pacman -F "${list[@]}" 2>/dev/null | awk '
+        /^[A-Za-z0-9_.+-]+\// {
+            repo = $0; sub(/\/.*/, "", repo)
+            pkg  = $0; sub(/^[^/]*\//, "", pkg); sub(/[ \t].*/, "", pkg)
+            next
+        }
+        /^[ \t]+usr\/lib/ {
+            p = $1
+            n = split(p, parts, "/")
+            base = parts[n]
+            if (base == "") next
+            if (p ~ /^usr\/lib32\//) { if (!(base in M32)) M32[base] = pkg; next }
+            if (p !~ /^usr\/lib\//)  next          # 跳过 usr/lib64、交叉工具链等
+            if      (repo == "core")     { if (!(base in C))  C[base]  = pkg }
+            else if (repo == "extra")    { if (!(base in E))  E[base]  = pkg }
+            else if (repo == "multilib") { if (!(base in MU)) MU[base] = pkg }
+            else                         { if (!(base in L))  L[base]  = pkg }
+        }
+        END {
+            for (b in C)  print b "\t" C[b]
+            for (b in E)  if (!(b in C)) print b "\t" E[b]
+            for (b in MU) if (!(b in C) && !(b in E)) print b "\t" MU[b]
+            for (b in L)  if (!(b in C) && !(b in E) && !(b in MU)) print b "\t" L[b]
+            for (b in M32) if (!(b in C) && !(b in E) && !(b in MU) && !(b in L)) print b "\t" M32[b]
+        }
+    '
+}
+
+# Debian 包名 → Arch 包名 的内建对照表（处理那些推不出 soname 的依赖）
+BUILTIN_MAP=$(cat <<'MAP'
+libc6 glibc
+libc6-dev glibc
+libgcc1 gcc-libs
+libgcc-s1 gcc-libs
+libstdc++6 gcc-libs
+libncurses6 ncurses
+libncursesw6 ncurses
+libtinfo6 ncurses
+zlib1g zlib
+libz1 zlib
+libpcre3 pcre
+libpcre2-8-0 pcre2
+libssl3 openssl
+libssl1.1 openssl
+libcrypto3 openssl
+libcurl4 curl
+libcurl3-gnutls curl
+libgnutls30 gnutls
+libsystemd0 systemd-libs
+libudev1 systemd-libs
+python3 python
+python python
+perl perl
+openjdk-17-jre-headless jre-openjdk-headless
+default-jre java-runtime
+default-jre-headless java-runtime-headless
+fonts-dejavu-core ttf-dejavu
+fonts-dejavu fonts-dejavu
+xdg-utils xdg-utils
+desktop-file-utils desktop-file-utils
+shared-mime-info shared-mime-info
+hicolor-icon-theme hicolor-icon-theme
+ca-certificates ca-certificates
+fonts-liberation ttf-liberation
+libx11-6 libx11
+libxext6 libxext
+libxss1 libxss
+libxtst6 libxtst
+libgbm1 mesa
+libgl1 mesa
+libegl1 mesa
+libglx0 mesa
+libglu1-mesa glu
+libasound2 alsa-lib
+libasound2-plugins alsa-plugins
+libnss3 nss
+libnspr4 nspr
+libatk1.0-0 atk
+libatk-bridge2.0-0 at-spi2-core
+libatspi2.0-0 at-spi2-core
+libcups2 libcups
+libdrm2 libdrm
+libxkbcommon0 libxkbcommon
+libsecret-1-0 libsecret
+libnotify4 libnotify
+gconf-service gconf
+libappindicator3-1 libappindicator-gtk3
+libappindicator1 libappindicator-gtk3
+libayatana-appindicator3-1 libayatana-appindicator
+libdbusmenu-glib4 libdbusmenu-glib
+libdbusmenu-gtk3-4 libdbusmenu-gtk3
+gvfs-bin gvfs
+libu2f-udev libu2f-host
+libgnome-keyring0 libgnome-keyring
+libgtk2.0-0 gtk2
+libgtk-3-0 gtk3
+libgtk-4-1 gtk4
+libqt5core5a qt5-base
+libqt5gui5 qt5-base
+libqt5widgets5 qt5-base
+libqt5network5 qt5-base
+libqt5dbus5 qt5-base
+libqt5x11extras5 qt5-x11extras
+libqt5svg5 qt5-svg
+libqt6core6 qt6-base
+libqt6gui6 qt6-base
+libqt6widgets6 qt6-base
+libqt6network6 qt6-base
+libqt6dbus6 qt6-base
+libqt6svg6 qt6-svg
+MAP
+)
+
+builtin_lookup() {
+    printf '%s\n' "$BUILTIN_MAP" | awk -v n="$1" '$1 == n { print $2; exit }'
+}
+
+# 解析 Depends 里那些推不出 soname 的条目
+map_debian_dep() {
+    local d=$1
+    d=${d%%:*}                 # 去掉 :any / :amd64
+    d=${d%%[[:space:]]*}       # 去掉版本约束
+    d=${d%%(*}
+    [ -n "$d" ] || return 0
+    local hit
+    hit=$(builtin_lookup "$d")
+    [ -n "$hit" ] && { echo "$hit"; return 0; }
+    # 已经在 Arch 仓库里同名存在 → 直接用
+    if pacman -Ssq "^${d}$" 2>/dev/null | grep -qx "$d"; then
+        echo "$d"; return 0
+    fi
+    return 0
+}
+
+# 检查 Arch 仓库里是否真的有这个包
+# 【性能】逐个 pacman -Ssq 反查也是 N 次调用。改成一次 pacman -Slq 拿到全量包名，
+# 之后本地比对。首次调用约 1s，随后零成本。
+_REPO_PKGS=""
+in_repo() {
+    if [ -z "$_REPO_PKGS" ]; then
+        _REPO_PKGS=$(pacman -Slq 2>/dev/null | sort -u)
+        [ -n "$_REPO_PKGS" ] || { _REPO_PKGS="__EMPTY__"; return 1; }
+    fi
+    grep -qxF "$1" <<<"$_REPO_PKGS"
+}
+
+# ---------------------------------------------------------------- 只读分析
+# 输出刻意做成「人看得懂 + GUI 能解析」两种用途兼顾：
+#   * 每段以 ==> 开头，GUI 据此上色
+#   * 结果行以 ✓ / ! / ✗ 开头，GUI 据此判定严重程度
+#   * 包名 / 版本 / 架构 顶格跟在两个空格后，GUI 的摘要卡片正则直接抓
+analyze_deb() {
+    local name ver darch pv pr aarch S
+    name=$(field Package); ver=$(field Version); darch=$(field Architecture)
+    read -r pv pr <<<"$(split_version "$ver")"
+    aarch=$(map_arch "$darch")
+    S=$(mktemp -d)
+    dpkg-deb -x "$DEB" "$S/root" >/dev/null 2>&1
+    dpkg-deb -e "$DEB" "$S/ctl" >/dev/null 2>&1
+
+    echo
+    info "包信息"
+    printf '  %s %s\n' "包名        " "$name"
+    printf '  %s %s\n' "版本        " "$ver"
+    printf '  %s %s\n' "架构        " "$darch"
+    printf '  %s %s\n' "描述        " "$(field Description)"
+    printf '  %s %s\n' "主页        " "$(field Homepage)"
+    printf '  %s %s\n' "维护者      " "$(field Maintainer)"
+    printf '  %s %s\n' "文件数      " "$(find "$S/root" -type f 2>/dev/null | wc -l)"
+    printf '  %s %s-%s\n' "Arch 版本  " "$pv" "$pr"
+    printf '  %s %s\n' "Arch 架构  " "$aarch"
+    case "${darch,,}" in
+        amd64|x86_64|all|any|noarch) ok "架构匹配本机" ;;
+        *) warn "架构是 $darch，本机通常需要 x86_64" ;;
+    esac
+
+    echo
+    info "安装脚本审计"
+    audit_scriptlets "$S/ctl"
+
+    echo
+    info "写入路径"
+    check_top_paths "$S/root"
+
+    echo
+    info "动态库依赖解析"
+    printf '  %s.deb 声明的依赖（Depends / Pre-Depends）：%s\n' "$CD" "$C0"
+    printf '    %s\n' "$(field Depends)"
+    [ -n "$(field Pre-Depends)" ] && printf '    %s\n' "$(field Pre-Depends)"
+    local s pkg n_ok=0 n_no=0
+    local shipped; shipped=$(shipped_sonames "$S/root")
+    local missing=""
+    local need_sonames
+    need_sonames=$(elf_sonames "$S/root" | grep -vxF "$(printf '%s\n' "$shipped")" 2>/dev/null || true)
+    local resolved; resolved=$(printf '%s\n' "$need_sonames" | resolve_sonames)
+    for s in $need_sonames; do
+        pkg=$(awk -F'\t' -v k="$s" '$1==k{print $2; exit}' <<<"$resolved")
+        if [ -n "$pkg" ]; then
+            printf '    %-30s → %s\n' "$s" "$pkg"
+            n_ok=$((n_ok+1))
+        else
+            printf '    %-30s → %s未找到%s\n' "$s" "$CY" "$C0"
+            missing="$missing$s "
+            n_no=$((n_no+1))
+        fi
+    done
+    if [ $((n_ok+n_no)) -eq 0 ]; then
+        warn "没找到可执行文件，跳过 ldd 检查"
+    elif [ "$n_no" -gt 0 ]; then
+        bad "缺失库 $n_no 个，Arch 仓库不提供：$missing"
+        if [ $COMPAT_LIBS -eq 1 ]; then
+            printf '      %s→ 装的时候会自动从 Debian 取到 %s%s\n' "$CD" "$COMPAT_DIR" "$C0"
+            printf '      %s→ 并生成兼容启动器（LD_LIBRARY_PATH 得有人注入）+ 用户级桌面入口%s\n' "$CD" "$C0"
+            printf '      %s→ 不想让它动这些：加 --no-compat%s\n' "$CD" "$C0"
+        else
+            printf '      %s→ 已用 --no-compat 关闭自动补库，需自行处理%s\n' "$CD" "$C0"
+        fi
+    else
+        ok "所有动态库已满足（$n_ok 个）"
+    fi
+
+    echo
+    info "冲突检测"
+    check_desktop_shadow "$S/root"
+    check_ll_cli "$name"
+
+    rm -rf "$S"
+}
+
+[ "$MODE" = analyze ] && { analyze_deb; exit 0; }
+
+# ---------------------------------------------------------------- 生成 .INSTALL
+make_install_script() {   # $1 = ctl 目录, $2 = 输出文件
+    local ctl=$1 out=$2
+    local any=0
+    # 只统计真正会生成钩子的脚本：默认不含移除阶段
+    for f in preinst postinst; do
+        [ -s "$ctl/$f" ] && any=1
+    done
+    if [ $RUN_REMOVE_HOOKS -eq 1 ]; then
+        for f in prerm postrm; do
+            [ -s "$ctl/$f" ] && any=1
+        done
+    fi
+    [ $any -eq 0 ] && return 1
+    [ $RUN_SCRIPTLETS -eq 0 ] && return 1
+
+    {
+        echo '#!/bin/bash'
+        echo '# Generated by debinstall — 运行 .deb 自带的维护脚本（尽力而为，失败不影响安装）'
+        echo
+        cat <<'HDR'
+_db_run() {
+    local label="$1" b64="$2" action="$3" ver="$4"
+    local d; d="$(mktemp -d)" || return 0
+    printf '%s' "$b64" | base64 -d > "$d/s" 2>/dev/null || { rm -rf "$d"; return 0; }
+    chmod 755 "$d/s"
+    if [ -d /usr/local/lib/debinstall/shims ]; then
+        export PATH="/usr/local/lib/debinstall/shims:$PATH"
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    export DEBINSTALL_SCRIPTLET="$label"
+    bash "$d/s" "$action" "$ver" >/dev/null 2>&1 || true
+    rm -rf "$d"
+    return 0
+}
+HDR
+        echo
+        for f in preinst postinst prerm postrm; do
+            [ -s "$ctl/$f" ] || continue
+            printf '%s_B64() { printf %%s \x27%s\x27; }\n' "$f" "$(base64 -w0 < "$ctl/$f")"
+        done
+        echo
+        if [ -s "$ctl/preinst" ]; then
+            cat <<'X'
+pre_install()  { _db_run "preinst"  "$(preinst_B64)"  "install" "$1"; }
+pre_upgrade()  { _db_run "preinst"  "$(preinst_B64)"  "upgrade" "$2"; }
+X
+        fi
+        if [ -s "$ctl/postinst" ]; then
+            cat <<'X'
+post_install() { _db_run "postinst" "$(postinst_B64)" "configure" "$1"; }
+post_upgrade() { _db_run "postinst" "$(postinst_B64)" "configure" "$2"; }
+X
+        fi
+        if [ $RUN_REMOVE_HOOKS -eq 1 ]; then
+            if [ -s "$ctl/prerm" ]; then
+                cat <<'X'
+pre_remove()   { _db_run "prerm"    "$(prerm_B64)"    "remove" "$1"; }
+X
+            fi
+            if [ -s "$ctl/postrm" ]; then
+                cat <<'X'
+post_remove()  { _db_run "postrm"   "$(postrm_B64)"   "remove" "$1"; }
+X
+            fi
+        else
+            cat <<'X'
+# 移除阶段钩子默认不生成：debian 的 prerm/postrm 在 Arch 上基本是空转
+# （update-alternatives / AppArmor / systemd 单元清理都用不上），
+# 却会在你早已忘记安装时那份警告的情况下、以 root 执行外来代码。
+# 确需执行请加 --run-remove-hooks。
+X
+        fi
+    } > "$out"
+    return 0
+}
+
+# ---------------------------------------------------------------- 构建 Arch 包
+build_arch_pkg() {   # $1 = 输出目录 → 回显生成的包路径
+    local outdir=$1
+    info "读取 .deb 元数据"
+    local name ver darch pv pr desc url
+    name=$(field Package); ver=$(field Version); darch=$(field Architecture)
+    desc=$(field Description); url=$(field Homepage)
+    [ -n "$name" ] || die "这个 .deb 没有 Package 字段，可能不是标准 Debian 包"
+    name=$(sanitize_name "$name")
+    read -r pv pr <<<"$(split_version "$ver")"
+    local aarch; aarch=$(map_arch "$darch")
+
+    if [ "$aarch" != "any" ] && [ "$aarch" != "$(uname -m)" ]; then
+        warn "这是 $darch（$aarch）的包，本机是 $(uname -m)。"
+        [ "$aarch" = "i686" ] && warn "32 位包需要 multilib 里的 lib32-* 运行库，且 pacman 可能拒绝安装。"
+        warn "继续转换，但安装很可能失败。"
+    fi
+
+    # 与已存在的 Arch 包重名 → 加 -deb 后缀
+    if in_repo "$name"; then
+        warn "仓库里已有同名包 $name，改名安装为 ${name}-deb 以避免混淆"
+        name="${name}-deb"
+    fi
+
+    local root="$WORK/root" ctl="$WORK/ctl"
+    mkdir -p "$root" "$ctl"
+    info "解包 .deb 数据"
+    dpkg-deb -x "$DEB" "$root" || die "解包数据失败"
+    dpkg-deb -e "$DEB" "$ctl" 2>/dev/null || true
+
+    # 目录权限规范化。.deb 里目录常是 775（drwxrwxr-x），照搬的后果：
+    #   * pacman 会对已存在的 /opt、/usr/share 等目录报「目录权限不一致」
+    #   * 包新建的 /opt/<app> 也变成组可写 —— 组里有人就能替换应用二进制
+    # 只动目录、不动文件（有些包确实需要文件带特殊位）。
+    if [ -z "${DEBINSTALL_KEEP_DIR_PERM:-}" ]; then
+        find "$root" -type d -exec chmod go-w {} + 2>/dev/null || true
+    fi
+
+    # ---------- 依赖 ----------
+    info "推导依赖（ELF NEEDED → pacman 文件库反查）"
+    local shipped deps=() s pkg
+    shipped=$(shipped_sonames "$root")
+    local need_sonames resolved
+    need_sonames=$(elf_sonames "$root" | grep -vxF "$(printf '%s\n' "$shipped")" 2>/dev/null || true)
+    resolved=$(printf '%s\n' "$need_sonames" | resolve_sonames)
+    for s in $need_sonames; do
+        pkg=$(awk -F'\t' -v k="$s" '$1==k{print $2; exit}' <<<"$resolved")
+        [ -n "$pkg" ] && deps+=("$pkg")
+    done
+
+    # .deb 声明的依赖里，映射表能对上的也补进来
+    local dd mapped
+    while IFS= read -r dd; do
+        [ -n "$dd" ] || continue
+        mapped=$(map_debian_dep "$dd")
+        [ -n "$mapped" ] && deps+=("$mapped")
+    done < <(printf '%s\n' "$(field Depends)" "$(field Pre-Depends)" \
+             | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+             | sed 's/|/\n/g' | sed 's/^[[:space:]]*//' | awk '!seen[$0]++')
+
+    # 去重 + 只保留仓库里真实存在的
+    local uniq=() d
+    if [ ${#deps[@]} -gt 0 ]; then
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            [ "$d" = "$name" ] && continue
+            if in_repo "$d"; then uniq+=("$d")
+            else warn "依赖 $d 在仓库中不存在，已跳过"; fi
+        done < <(printf '%s\n' "${deps[@]}" | sort -u)
+    fi
+
+    # ---------- .PKGINFO ----------
+    local size epoch
+    size=$(du -sb --exclude='.PKGINFO' --exclude='.INSTALL' --exclude='.MTREE' "$root" 2>/dev/null | cut -f1)
+    epoch=$(date +%s)
+    {
+        echo "# Generated by debinstall $VERSION"
+        echo "pkgname = $name"
+        echo "pkgbase = $name"
+        echo "xdata = pkgtype=pkg"
+        echo "pkgver = $pv-$pr"
+        echo "pkgdesc = $(printf '%s' "${desc:-Debian package $name}" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-200)"
+        [ -n "$url" ] && echo "url = $url"
+        echo "builddate = $epoch"
+        echo "packager = debinstall <debinstall@localhost>"
+        echo "size = ${size:-0}"
+        echo "arch = $aarch"
+        echo "license = custom"
+        for d in "${uniq[@]:-}"; do [ -n "$d" ] && echo "depend = $d"; done
+    } > "$root/.PKGINFO"
+
+    # ---------- .INSTALL ----------
+    if make_install_script "$ctl" "$root/.INSTALL"; then
+        info "已生成 .INSTALL（会执行 .deb 自带的 postinst/prerm 等）"
+    fi
+
+    # ---------- 打包 ----------
+    info "打包为 Arch 包"
+    local pkgfile="${name}-${pv}-${pr}-${aarch}.pkg.tar.zst"
+    mkdir -p "$outdir"
+    cat > "$WORK/_build.sh" <<'BUILD'
+set -e
+cd "$1"
+export LC_ALL=C LANG=C
+
+# 注意：这里绝对不能用 -n！GNU tar 的 -n 是 --seek（写盘时忽略），
+# 但 bsdtar 的 -n 是 --no-recursion，会让目录只进一个空壳、包变成空的。
+opt=()
+[ -f .INSTALL ] && opt+=(.INSTALL)
+
+mapfile -t tops < <(find . -mindepth 1 -maxdepth 1 \
+        ! -name '.PKGINFO' ! -name '.INSTALL' ! -name '.MTREE' -printf '%P\n' | LC_ALL=C sort)
+
+# 1) .MTREE（不包含自身）
+{ printf '%s\0' .PKGINFO "${opt[@]}" "${tops[@]}"; } \
+  | bsdtar -cf - --format=mtree \
+        --options='!all,use-set,type,uid,gid,mode,time,size,sha256,link' \
+        --null --files-from - \
+  | gzip -c -f -n > .MTREE
+
+# 2) 真正的包：元数据在前，文件树在后
+{ printf '%s\0' .PKGINFO "${opt[@]}" .MTREE "${tops[@]}"; } \
+  | bsdtar --no-fflags --no-read-sparse -cf - --null --files-from - \
+  | zstd -q -c -T0 > "$2"
+BUILD
+    fakeroot -- bash "$WORK/_build.sh" "$root" "$outdir/$pkgfile" \
+        || die "打包失败（fakeroot 阶段出错）"
+    [ -s "$outdir/$pkgfile" ] || die "打包失败：输出为空"
+
+    # 自检：包里的条目数必须和源树对得上（防目录被吞成空壳的静默失败）
+    local n_src n_pkg
+    n_src=$(find "$root" -mindepth 1 | wc -l)
+    n_pkg=$(bsdtar -tf "$outdir/$pkgfile" 2>/dev/null | wc -l)
+    if [ "$n_pkg" -lt "$n_src" ]; then
+        err "打包自检失败：源树 $n_src 个条目，包里只有 $n_pkg 个。"
+        err "（这是 bug，已中止，以免装出一个空包）"
+        exit 1
+    fi
+    # 再确认 .PKGINFO / .MTREE 齐备
+    for m in .PKGINFO .MTREE; do
+        bsdtar -tf "$outdir/$pkgfile" 2>/dev/null | grep -qx "$m" || die "打包自检失败：缺少 $m"
+    done
+
+    ok "已生成 $outdir/$pkgfile （$(du -h "$outdir/$pkgfile" | cut -f1)，$n_pkg 个条目）"
+    printf '%s\n' "$outdir/$pkgfile"
+}
+
+# ---------------------------------------------------------------- 安装到系统
+do_install() {
+    detect_escalation
+    local pkg
+    pkg=$(build_arch_pkg "$WORK/out" | tail -1)
+    [ -f "$pkg" ] || die "构建未产出包文件"
+
+    # 把 update-alternatives shim 落到 SHIMDIR，供 .INSTALL 里的钩子使用
+    if write_shim "$SHIMDIR" run_root; then
+        info "已就绪 update-alternatives shim（$SHIMDIR）"
+    else
+        warn "update-alternatives shim 未能写入 $SHIMDIR，个别包的命令名可能缺失"
+    fi
+
+    info "用 pacman 安装（这一步需要 root，会弹出授权框或要求输入密码）"
+    local args=(-U --noconfirm)
+    [ $OVERWRITE -eq 1 ] && { args+=(--overwrite); args+=('*'); warn "已启用 --overwrite，可能覆盖系统文件"; }
+    if run_root "$PACMAN" "${args[@]}" "$pkg"; then
+        ok "安装完成：$name_of_pkg"
+        echo
+        info "收尾"
+        # 补库要在桌面快捷方式之前做：它会生成用户级 .desktop，而桌面上那份
+        # 应当指向兼容启动器而不是包自带的 Exec。
+        # 复用 build_arch_pkg 解好的 $WORK/root，别再解一次 —— 有些包解开来
+        # 200MB 以上（网易邮箱大师 217MB），多解一次纯属浪费。
+        if [ $COMPAT_LIBS -eq 1 ]; then
+            local croot="$WORK/root"
+            if [ ! -d "$croot" ]; then
+                mkdir -p "$croot"
+                dpkg-deb -x "$DEB" "$croot" 2>/dev/null || warn "重新解包失败，跳过补库检查"
+            fi
+            [ -d "$croot" ] && setup_compat_libs "$croot"
+        fi
+        [ $MAKE_DESKTOP -eq 1 ] && make_desktop_shortcut
+        fix_electron
+        warn "启动测试时记得避开 ELECTRON_RUN_AS_NODE 污染（脚本环境里常被误设）"
+        printf '      %s setsid env -u ELECTRON_RUN_AS_NODE %s\n' "$PROG" "<应用路径>"
+        printf '      %s（从桌面图标启动不受影响，只有脚本里跑才会踩到）\n' "$CD"
+        printf '%s\n' "$CD"
+        printf '      装完请实际点一次图标确认能起来 —— 只发 .deb 的国产客户端\n'
+        printf '      常带发行版检查脚本或旧版 GUI 库，光看安装成功说明不了问题。%s\n' "$C0"
+    else
+        err "pacman 安装失败。"
+        echo >&2
+        warn "如果失败原因是文件冲突或依赖不满足，两个选择："
+        warn "  1) 换用户级安装（不需要 root，通常可行）："
+        warn "       $PROG -l \"$DEB\""
+        warn "  2) 明知冲突仍要覆盖（危险，请先看清楚冲突清单）："
+        warn "       $PROG --overwrite \"$DEB\""
+        [ $KEEP -eq 1 ] || { cp -n "$pkg" "$PWD/" 2>/dev/null && warn "生成的包已留在 $PWD/$(basename "$pkg") 供你手动处理"; }
+        exit 1
+    fi
+
+    if [ $KEEP -eq 1 ]; then
+        local dest=${OUTDIR:-$PWD}
+        mkdir -p "$dest"; cp -f "$pkg" "$dest/"
+        ok "Arch 包已保留到 $dest/$(basename "$pkg")"
+    fi
+}
+
+# ---------------------------------------------------------------- 解包到本地
+local_extract() {   # $1 = 目标根目录, $2 = 包名
+    local dest=$1
+    mkdir -p "$dest"
+    dpkg-deb -x "$DEB" "$dest" || die "解包失败"
+}
+
+rewrite_desktop() {  # $1 = 原始 desktop 文件, $2 = 本地安装根, $3 = 记录文件
+    local src=$1 root=$2 man=$3 line out key val first rest path
+    out="$WORK/$(basename "$src")"
+    : > "$out"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            Exec=*|TryExec=*|Path=*)
+                key=${line%%=*}; val=${line#*=}
+                read -r first rest <<<"$val" || true
+                first=${first:-}; rest=${rest:-}
+                path=""
+                if [ -n "$first" ]; then
+                    if [ "${first:0:1}" = "/" ]; then
+                        [ -e "$root$first" ] && path="$root$first"
+                    else
+                        [ -x "$root/usr/bin/$first" ] && path="$root/usr/bin/$first"
+                        [ -z "$path" ] && [ -x "$root/usr/games/$first" ] && path="$root/usr/games/$first"
+                    fi
+                fi
+                if [ "$key" = "TryExec" ] && [ -z "$path" ]; then
+                    continue          # TryExec 找不到就丢掉，免得启动器被禁用
+                fi
+                if [ -n "$path" ]; then
+                    printf '%s=%s%s\n' "$key" "$path" "${rest:+ $rest}" >> "$out"
+                else
+                    printf '%s\n' "$line" >> "$out"
+                fi
+                ;;
+            Icon=*)
+                val=${line#Icon=}
+                if [ "${val:0:1}" = "/" ]; then
+                    [ -e "$root$val" ] && printf 'Icon=%s\n' "$root$val" >> "$out" || printf '%s\n' "$line" >> "$out"
+                else
+                    printf '%s\n' "$line" >> "$out"
+                fi
+                ;;
+            *) printf '%s\n' "$line" >> "$out" ;;
+        esac
+    done < "$src"
+    printf '%s\n' "$out"
+}
+
+# 本地安装的已知局限，主动检测而不是让它静默失败：
+# Debian 的包装脚本常按【绝对路径】调用同包的其它二进制
+# （典型：figlet-utf8 里 `exec /usr/bin/figlet-figlet`）。
+# 本地模式下文件躺在 ~/.local/debinst/<pkg>/usr/bin/，真实 /usr/bin 里没有，
+# 于是命令能点到、一跑就报「没有那个文件或目录」。
+# 这里扫出这类引用并提醒用户改用系统安装。
+warn_local_abs_refs() {   # $1 = 本地安装根；有发现则返回 1
+    local dest=$1 f ref found=0
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        [ -L "$f" ] && continue
+        # 只看脚本，二进制不看
+        [ "$(head -c 2 "$f" 2>/dev/null)" = "#!" ] || continue
+        while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            [ -e "$ref" ] && continue          # 本机已有，没事
+            [ -d "$(dirname "$ref")" ] || true
+            printf '%s\n' "$ref"
+            found=1
+        done < <(grep -ohE '/(usr|opt)/[A-Za-z0-9._+/-]+' "$f" 2>/dev/null | sort -u)
+    done < <(find "$dest/usr/bin" "$dest/usr/games" "$dest/usr/libexec" -type f 2>/dev/null)
+
+    if [ $found -eq 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
+do_local() {
+    local name ver pv pr
+    name=$(sanitize_name "$(field Package)")
+    ver=$(field Version)
+    [ -n "$name" ] || die "这个 .deb 没有 Package 字段"
+    read -r pv pr <<<"$(split_version "$ver")"
+
+    local dest="$LOCALROOT/$name"
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+    if [ -d "$dest" ]; then
+        warn "$name 已经装过，先覆盖旧的"
+        rm -rf "$dest"
+    fi
+    info "解包到 $dest（不需要 root）"
+    local_extract "$dest" "$name"
+
+    local manifest="$dest/.debinstall-manifest"; : > "$manifest"
+    {
+        echo "name=$name"
+        echo "version=$pv-$pr"
+        echo "source=$DEB"
+        echo "installed=$(date -Iseconds)"
+    } > "$dest/.debinstall-info"
+
+    # 可执行文件 → ~/.local/bin 软链
+    local f b
+    for d in usr/bin usr/games usr/local/bin; do
+        [ -d "$dest/$d" ] || continue
+        for f in "$dest/$d"/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            b=$(basename "$f")
+            ln -sfn "$f" "$HOME/.local/bin/$b"
+            echo "$HOME/.local/bin/$b" >> "$manifest"
+        done
+    done
+
+    # 图标 → ~/.local/share/icons（保持 hicolor 层级）
+    if [ -d "$dest/usr/share/icons" ]; then
+        ( cd "$dest/usr/share/icons" && find . -type f -print0 ) |
+        while IFS= read -r -d '' rel; do
+            local tgt="$HOME/.local/share/icons/${rel#./}"
+            mkdir -p "$(dirname "$tgt")"
+            cp -f "$dest/usr/share/icons/${rel#./}" "$tgt" 2>/dev/null && echo "$tgt" >> "$manifest"
+        done
+    fi
+    if [ -d "$dest/usr/share/pixmaps" ]; then
+        mkdir -p "$HOME/.local/share/pixmaps"
+        for f in "$dest/usr/share/pixmaps"/*; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "$HOME/.local/share/pixmaps/" && echo "$HOME/.local/share/pixmaps/$(basename "$f")" >> "$manifest"
+        done
+    fi
+
+    # .desktop → 重写路径后装到 ~/.local/share/applications
+    if [ -d "$dest/usr/share/applications" ]; then
+        for f in "$dest/usr/share/applications"/*.desktop; do
+            [ -f "$f" ] || continue
+            local newd tgt
+            newd=$(rewrite_desktop "$f" "$dest" "$manifest" | tail -1)
+            [ -f "$newd" ] || continue
+            tgt="$HOME/.local/share/applications/$(basename "$f")"
+            cp -f "$newd" "$tgt"
+            echo "$tgt" >> "$manifest"
+        done
+    fi
+
+    # 桌面目录里可能还引用 /usr/share/applications 的绝对路径，一并纠正
+    if [ -d "$dest/usr/share/applications" ]; then
+        for f in "$HOME/.local/share/applications"/*.desktop; do
+            [ -f "$f" ] || continue
+            grep -q "$dest" "$f" 2>/dev/null || continue
+            sed -i "s|/usr/share/applications/$name\.desktop|$dest/usr/share/applications/$name.desktop|g" "$f"
+        done
+    fi
+
+    have update-desktop-database && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1
+    have gtk-update-icon-cache && gtk-update-icon-cache -qtf "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1
+
+    # 补 update-alternatives 生成的命令名（本地模式不跑 postinst，得自己来）
+    local _ctl="$WORK/ctl-local"
+    mkdir -p "$_ctl" && dpkg-deb -e "$DEB" "$_ctl" 2>/dev/null
+    emulate_alternatives_local "$dest" "$_ctl" "$manifest"
+
+    ok "$name 已装到 $dest"
+    [ $MAKE_DESKTOP -eq 1 ] && make_desktop_shortcut "$HOME/.local/share/applications"
+    msg ""
+    msg "  可执行文件软链： ~/.local/bin/"
+    msg "  桌面入口：       ~/.local/share/applications/"
+    if [ -d "$dest/usr/lib" ] || [ -d "$dest/opt" ]; then
+        msg "  提示：这个包自带运行库，若启动报缺库，可试"
+        msg "        LD_LIBRARY_PATH=\"$dest/usr/lib\" <程序>"
+    fi
+    msg "  卸载：$PROG -R $name"
+
+    # 已知局限提醒：包装脚本硬编码 /usr 绝对路径
+    local _refs
+    _refs=$(warn_local_abs_refs "$dest" || true)
+    if [ -n "$_refs" ]; then
+        echo
+        warn "这个包里有脚本按绝对路径调用同包的其它文件，本机该路径不存在："
+        printf '%s\n' "$_refs" | sort -u | sed 's/^/        /'
+        warn "本地安装下这些命令能点到但一跑就报错。改用系统安装即可："
+        printf '      %s --install --no-desktop "%s"\n' "$PROG" "$DEB"
+    fi
+}
+
+# ---------------------------------------------------------------- 主流程
+case "$MODE" in
+    install)
+        WORK=$(mktemp -d /tmp/debinstall.XXXXXX)
+        # 先体检。让「装」这个动作永远发生在看清楚之后 —— .deb 自带的
+        # postinst 会以 root 执行，不给用户看一眼就装是不负责任的。
+        analyze_deb
+        echo
+        detect_escalation
+        name_of_pkg=$(sanitize_name "$(field Package)")
+        if [ "$DANGER" -eq 1 ]; then
+            bad "上面这个包的自带脚本含高危操作，安装后它会以 root 执行"
+            if [ $ASSUME_YES -eq 0 ]; then
+                if [ -t 0 ]; then
+                    printf '  确认信任并继续安装？输入 yes 才继续： '
+                    read -r a; [ "$a" = "yes" ] || die "已取消"
+                elif [ $ALLOW_DANGER -eq 0 ]; then
+                    die "非交互模式下拒绝安装高危包（确认信任请加 --allow-dangerous）"
+                fi
+            fi
+        elif [ $ASSUME_YES -eq 0 ] && [ -t 0 ]; then
+            printf '转换为 Arch 包并用 pacman 安装？[Y/n] '
+            read -r a; case "$a" in [nN]*) die "已取消" ;; esac
+        fi
+        do_install
+        ;;
+    convert)
+        WORK=$(mktemp -d /tmp/debinstall.XXXXXX)
+        pkg=$(build_arch_pkg "${OUTDIR:-$PWD}" | tail -1)
+        msg ""
+        ok "完成。用 sudo pacman -U \"$pkg\" 安装。"
+        ;;
+    local)
+        WORK=$(mktemp -d /tmp/debinstall.XXXXXX)
+        do_local
+        ;;
+    extract)
+        [ -n "$EXTRACT_DIR" ] || die "-x 需要指定目标目录"
+        WORK=$(mktemp -d /tmp/debinstall.XXXXXX)
+        info "解包到 $EXTRACT_DIR"
+        dpkg-deb -x "$DEB" "$EXTRACT_DIR" || die "解包失败"
+        ok "完成：$EXTRACT_DIR"
+        ;;
+    *)
+        die "未知模式：$MODE" ;;
+esac

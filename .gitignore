@@ -1,6 +1,14 @@
 __pycache__/
 *.pyc
-src/
+
+# 打包/构建产物
 pkg/
+src/
+dist/
 *.pkg.tar.zst
 *.tar.gz
+*.tar.gz.sha256
+
+# 手工试打的 AppImage
+*.AppImage
+/build/

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+# deb-install-open — 供文件管理器双击 .deb 时调用
+#
+# 行为：先跑只读分析 → 询问是否安装 → 结束前等待按键
+# （双击场景下终端会随进程退出而关闭，所以必须停一下让用户看清结果。）
+#
+set -uo pipefail
+
+pause() {
+    printf '\n%s── 按回车键关闭窗口 ──%s' $'\033[2m' $'\033[0m'
+    read -r _ 2>/dev/null || true
+}
+
+if [ $# -eq 0 ]; then
+    echo "用法: deb-install-open <包.deb> [...]"
+    pause
+    exit 1
+fi
+
+# 只挑出真实存在的 .deb（文件管理器可能传 -- 之类的参数）
+DEBS=()
+for a in "$@"; do
+    [ "$a" = "--" ] && continue
+    if [ -f "$a" ]; then
+        DEBS+=("$a")
+    fi
+done
+
+if [ ${#DEBS[@]} -eq 0 ]; then
+    echo "没有可处理的 .deb 文件。"
+    pause
+    exit 1
+fi
+
+command -v deb-install >/dev/null 2>&1 || {
+    echo "找不到 deb-install（应在 ~/.local/bin 下，请确认它在 PATH 中）"
+    pause
+    exit 1
+}
+
+for deb in "${DEBS[@]}"; do
+    clear 2>/dev/null || true
+    printf '\033[1m════════════════════════════════════════════════════════\033[0m\n'
+    printf '\033[1m DEB 安装助手\033[0m  ·  %s\n' "$(basename "$deb")"
+    printf '\033[1m════════════════════════════════════════════════════════\033[0m\n\n'
+
+    if ! deb-install "$deb"; then
+        echo
+        echo "分析未能完成，跳过这个文件。"
+        continue
+    fi
+
+    echo
+    printf '\033[1m是否现在安装这个包？\033[0m [y/N] '
+    read -r ans 2>/dev/null || ans=""
+
+    case "$ans" in
+        y|Y|yes|YES)
+            echo
+            deb-install --install "$deb"
+            echo
+            printf '\033[32m安装流程结束。\033[0m\n'
+            ;;
+        *)
+            echo
+            printf '\033[33m已取消，未对系统做任何改动。\033[0m\n'
+            ;;
+    esac
+done
+
+pause

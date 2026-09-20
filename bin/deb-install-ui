@@ -1,0 +1,980 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+deb-install-ui — 软件包安装程序图形界面（GTK3 / PyGObject）
+
+两类输入，两条路径：
+  .deb       包一层 deb-install 引擎：只读分析（依赖、安装脚本、冲突）→ 确认后安装
+  .AppImage  不碰引擎：只用 file/7z 只读检查 → 移到 ~/Applications、
+             提取图标并注册应用菜单（AppImageLauncher 式），全程不需要 root
+
+命令行可传包路径（文件管理器双击时用）：
+  deb-install-ui /path/to/pkg.deb
+  deb-install-ui /path/to/app.AppImage
+
+为什么用 GTK 而不是 tkinter：本机 Tk（WorkBuddy 自带 Tk 9.0）的字体后端
+不可用，families() 只返回 ['fixed']，中文被测量为 0 宽度，标签直接不可见；
+系统 python3 则根本没有 libtk8.6.so。GTK 走 Pango，中文渲染正常。
+"""
+
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+APP_TITLE = "软件包安装程序"
+
+# AppImage 的 type-1 版本是 shell 脚本包装，本工具不支持（比对时用小写）
+_TYPE1_HINT = ("shell script", "ascii text", "empty")
+
+
+def is_appimage(path):
+    """按扩展名判断（大小写不敏感）。真正的校验在只读扫描里做。"""
+    return path.lower().endswith(".appimage")
+
+
+def slugify(text):
+    """把 .desktop 的 Name 变成能当文件名用的标识；清不掉就退化成 appimage"""
+    s = re.sub(r"[^0-9A-Za-z_.+-]+", "-", text or "").strip("-.")
+    return "appimage" if s in ("", "..") else s
+
+CSS = b"""
+window, .root { background-color: #1b1e20; }
+label, checkbutton { color: #eff0f1; }
+.identity { color: #9da5a8; font-size: 12px; }
+/* status banner: android-style phase hint, recolored per step */
+.status { font-size: 15px; font-weight: bold; }
+.status-idle  { color: #9da5a8; }
+.status-busy  { color: #3daee9; }
+.status-ready { color: #eff0f1; }
+.status-ok    { color: #2ecc71; }
+.status-warn  { color: #f67400; }
+.status-err   { color: #da4453; }
+expander > label { color: #9da5a8; font-size: 12px; }
+entry {
+    background-color: #2a2e32;
+    color: #eff0f1;
+    border: 1px solid #2a2e32;
+    border-radius: 5px;
+    padding: 7px 9px;
+    caret-color: #eff0f1;
+}
+entry:focus { border-color: #3daee9; }
+button {
+    background-color: #31363b;
+    color: #eff0f1;
+    border: none;
+    border-radius: 5px;
+    padding: 8px 16px;
+    background-image: none;
+    text-shadow: none;
+}
+button:hover { background-color: #3d4247; }
+button:disabled { background-color: #232629; color: #5c6366; }
+button.accent {
+    background-color: #3daee9;
+    color: #0d1117;
+    font-weight: bold;
+    padding: 8px 22px;
+}
+button.accent:hover { background-color: #4cbdf5; }
+button.accent:disabled { background-color: #2b4b5c; color: #7b8b94; }
+textview, textview text {
+    background-color: #232629;
+    color: #c8cfd2;
+    font-family: monospace;
+    font-size: 11px;
+}
+progressbar trough { background-color: #232629; border-radius: 2px; min-height: 3px; }
+progressbar progress { background-color: #3daee9; border-radius: 2px; min-height: 3px; }
+"""
+
+
+def find_tool():
+    """定位 deb-install
+
+    查找顺序：环境变量 DEB_INSTALL_TOOL → PATH 里的 deb-install →
+    标准安装位置。安装脚本会把下面的占位符替换成实际前缀，
+    这样装到非标准位置（比如 /opt/debinstall）也能找到。
+    """
+    # 注意：校验用的标记必须拼开写。如果这里直接写字面量，安装时的
+    # sed 会把它一起替换掉，于是装好之后这个判断反而会跳过正确路径。
+    _PH = "@PREFIX_" + "BIN@"
+
+    cands = []
+    env = os.environ.get("DEB_INSTALL_TOOL")
+    if env:
+        cands.append(env)
+    cands += [
+        "deb-install",
+        os.path.expanduser("~/.local/bin/deb-install"),
+        "/usr/local/bin/deb-install",
+        # 下面这行写的是占位符，安装脚本会替换成实际安装位置
+        "@PREFIX_BIN@/deb-install",
+    ]
+    for cand in cands:
+        if _PH in cand:                  # 占位符原样存在（还没安装，源码树里跑）
+            continue
+        p = shutil.which(cand) if "/" not in cand else cand
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+class DebInstallerUI(Gtk.Window):
+    def __init__(self, initial=None):
+        super().__init__(title=APP_TITLE)
+        self.tool = find_tool()
+        self.dangerous = False      # 分析时发现高危脚本则置位
+        self.busy = False
+        self.proc = None
+        self.initial = initial
+        self.pkg_name = None        # 分析时从输出抓到的（净化后）包名
+        self.install_question = "要安装此应用吗？"
+        self._done_state = False    # 安装完成后按钮变"完成"
+        self._id_pkg = None
+        self._id_ver = None
+        self.kind = "deb"           # deb | appimage，决定安装走引擎还是走 AppImage 分支
+        self.ai = None              # AppImage 元数据（扫描结果）
+        self._ai_pending = None     # 扫描线程写的临时结果，主线程确认后才采用
+        self._slug = None
+
+        self.set_default_size(700, 520)
+        self.set_border_width(0)
+        self._apply_css()
+
+        self._build_ui()
+
+        if not self.tool:
+            self._set_status("找不到 deb-install 引擎（.AppImage 仍可安装）", "warn")
+            self._append("找不到 deb-install 引擎，.deb 无法分析；"
+                         ".AppImage 不依赖它，仍可安装。\n", "warn")
+        if initial:
+            GLib.timeout_add(300, self._auto_analyze)
+
+        self.connect("destroy", self._on_destroy)
+
+    # ── 主题 ────────────────────────────────────────────────────────────
+    def _apply_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ── 布局 ────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class("root")
+        root.set_border_width(18)
+        self.add(root)
+
+        # ── 状态横幅（仿 LineageOS 安装器：主界面只给一句话进度）──
+        self.status = Gtk.Label(label="等待选择安装包", xalign=0)
+        self.status.get_style_context().add_class("status")
+        self.status.get_style_context().add_class("status-idle")
+        self.status.set_line_wrap(True)
+        root.pack_start(self.status, False, False, 0)
+
+        # ── 应用标识：包名 + 版本单行极简，其余信息在"详细输出"里 ──
+        self.identity = Gtk.Label(label="—", xalign=0)
+        self.identity.get_style_context().add_class("identity")
+        self.identity.set_margin_top(6)
+        self.identity.set_line_wrap(True)
+        root.pack_start(self.identity, False, False, 0)
+
+        # ── 文件选择 ──
+        pick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        pick.set_margin_top(14)
+        self.entry = Gtk.Entry()
+        self.entry.set_text(self.initial or "")
+        self.entry.set_hexpand(True)
+        self.entry.connect("activate", lambda *_: self.analyze())
+        pick.pack_start(self.entry, True, True, 0)
+
+        btn_pick = Gtk.Button(label="选择文件")
+        btn_pick.connect("clicked", self._on_pick)
+        pick.pack_start(btn_pick, False, False, 0)
+        root.pack_start(pick, False, False, 0)
+
+        # ── 详细输出：默认折叠，需要看逐行日志时再展开 ──
+        self.log_expander = Gtk.Expander(label="详细输出")
+        self.log_expander.set_hexpand(True)
+        self.log_expander.set_vexpand(True)
+        self.log_expander.set_margin_top(14)
+        self.log_expander.set_use_underline(False)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+        scroll.set_min_content_height(220)
+        scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        self.view = Gtk.TextView()
+        self.view.set_editable(False)
+        self.view.set_cursor_visible(False)
+        self.view.set_monospace(True)
+        self.view.set_left_margin(12)
+        self.view.set_right_margin(8)
+        self.view.set_top_margin(9)
+        self.view.set_bottom_margin(9)
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.buf = self.view.get_buffer()
+        self._init_tags()
+        scroll.add(self.view)
+        self.log_expander.add(scroll)
+        self.log_expander.set_expanded(False)     # 默认折叠
+        root.pack_start(self.log_expander, True, True, 0)
+
+        # ── 进度条 ──
+        self.bar = Gtk.ProgressBar()
+        self.bar.set_pulse_step(0.08)
+        self.bar.set_margin_top(9)
+        root.pack_start(self.bar, False, False, 0)
+
+        # ── 底部操作 ──
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bottom.set_margin_top(12)
+
+        self.chk_desktop = Gtk.CheckButton(label="安装后在桌面创建快捷方式")
+        self.chk_desktop.set_active(True)
+        bottom.pack_start(self.chk_desktop, True, True, 0)
+
+        self.btn_install = Gtk.Button(label="安装")
+        self.btn_install.get_style_context().add_class("accent")
+        self.btn_install.set_sensitive(False)
+        self.btn_install.set_visible(False)   # 仅在"等待用户点安装"阶段显示
+        self.btn_install.connect("clicked", self._on_install)
+        bottom.pack_end(self.btn_install, False, False, 0)
+
+        root.pack_start(bottom, False, False, 0)
+
+    def _init_tags(self):
+        colors = {"ok": "#2ecc71", "warn": "#f67400", "err": "#da4453",
+                  "info": "#3daee9", "fg": "#c8cfd2"}
+        self.tags = {}
+        for name, color in colors.items():
+            tag = self.buf.create_tag(name, foreground=color)
+            self.tags[name] = tag
+
+    # ── 日志 ────────────────────────────────────────────────────────────
+    def _append(self, text, tag=None):
+        end = self.buf.get_end_iter()
+        if tag and tag in self.tags:
+            self.buf.insert_with_tags(end, text, self.tags[tag])
+        else:
+            self.buf.insert(end, text)
+        # 自动滚到底
+        mark = self.buf.create_mark(None, self.buf.get_end_iter(), False)
+        self.view.scroll_mark_onscreen(mark)
+        self.buf.delete_mark(mark)
+
+    def _clear_log(self):
+        self.buf.set_text("")
+
+    _STATUS_KINDS = ("idle", "busy", "ready", "ok", "warn", "err")
+
+    def _set_status(self, text, kind="idle"):
+        """更新顶部状态横幅的文案与配色（仿安卓安装器的分步提示）"""
+        ctx = self.status.get_style_context()
+        for k in self._STATUS_KINDS:
+            ctx.remove_class("status-" + k)
+        ctx.add_class("status-" + kind)
+        self.status.set_text(text)
+
+    def _is_installed(self):
+        """是否已装过（用于区分"安装/更新"问句）。只读、快速失败。"""
+        if self.kind == "appimage":
+            return bool(self._slug) and os.path.isfile(self._manifest_path(self._slug))
+        if not self.pkg_name:
+            return False
+        exe = shutil.which("pacman")
+        if not exe:
+            return False
+        try:
+            r = subprocess.run([exe, "-Q", self.pkg_name],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            return r.returncode == 0
+        except Exception:      # noqa: BLE001
+            return False
+
+    def _enter_ready(self):
+        """扫描完成、等待用户点安装：横幅给问句，按钮显示安装/更新"""
+        update = self._is_installed()
+        self.install_question = "要更新此应用吗？" if update else "要安装此应用吗？"
+        self._set_status(self.install_question, "ready")
+        self.btn_install.set_label("更新" if update else "安装")
+        self.btn_install.set_visible(True)
+        self.btn_install.set_sensitive(True)
+
+    def _refresh_identity(self):
+        parts = [p for p in (self._id_pkg, self._id_ver) if p]
+        self.identity.set_text("  ".join(parts) if parts else "—")
+
+    def _reset_identity(self):
+        self._id_pkg = None
+        self._id_ver = None
+        self.pkg_name = None
+        self.kind = "deb"
+        self.ai = None
+        self._ai_pending = None
+        self._slug = None
+        self.identity.set_text("—")
+
+    # ── 事件 ────────────────────────────────────────────────────────────
+    def _on_pick(self, _btn):
+        dlg = Gtk.FileChooserDialog(
+            title="选择安装包", parent=self,
+            action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("取消", Gtk.ResponseType.CANCEL,
+                        "打开", Gtk.ResponseType.OK)
+        dlg.set_current_folder(os.path.expanduser("~/Downloads"))
+        f = Gtk.FileFilter()
+        f.set_name("安装包 (*.deb / *.AppImage)")
+        f.add_pattern("*.deb")
+        f.add_pattern("*.AppImage")      # GTK 的 pattern 在 Unix 下区分大小写
+        f.add_pattern("*.appimage")
+        f.add_mime_type("application/vnd.debian.binary-package")
+        f.add_mime_type("application/vnd.appimage")
+        dlg.add_filter(f)
+        f2 = Gtk.FileFilter()
+        f2.set_name("所有文件")
+        f2.add_pattern("*")
+        dlg.add_filter(f2)
+        if dlg.run() == Gtk.ResponseType.OK:
+            path = dlg.get_filename()
+            dlg.destroy()
+            if path:
+                self.entry.set_text(path)
+                self.analyze()
+        else:
+            dlg.destroy()
+
+    def _auto_analyze(self):
+        self.analyze()
+        return False
+
+    # ── 执行 ────────────────────────────────────────────────────────────
+    def _run(self, args, on_done):
+        self.busy = True
+        self.btn_install.set_sensitive(False)
+        self.bar.pulse()
+        self._pulsing = True
+        GLib.timeout_add(120, self._pulse)
+
+        def worker():
+            env = dict(os.environ)
+            env.pop("ELECTRON_RUN_AS_NODE", None)   # 避免污染子进程
+            rc = 1
+            try:
+                self.proc = subprocess.Popen(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, errors="replace", env=env)
+                for line in self.proc.stdout:
+                    GLib.idle_add(self._consume, line.rstrip("\n"))
+                rc = self.proc.wait()
+            except Exception as e:                   # noqa: BLE001
+                GLib.idle_add(self._append, f"执行失败: {e}\n", "err")
+            finally:
+                self.proc = None
+            GLib.idle_add(self._finish, rc, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pulse(self):
+        if not self.busy:
+            return False
+        self.bar.pulse()
+        return True
+
+    def _finish(self, rc, on_done):
+        self.busy = False
+        self.bar.set_fraction(0.0)
+        if on_done:
+            on_done(rc)
+        return False
+
+    # ── AppImage ────────────────────────────────────────────────────────
+    #
+    # AppImage = ELF 可执行文件 + 尾部追加的 squashfs。这里**只读**它：
+    # file 认架构、7z 列目录并抽取 .desktop / 图标。全程不挂载、不执行，
+    # 因为输入是不可信的第三方二进制 —— 跑一次就等于让对方在你机器上任意执行。
+
+    def _run_thread(self, fn, on_done):
+        """把纯数据的后台任务接到同一套 busy/进度条/收尾流程上"""
+        self.busy = True
+        self.btn_install.set_sensitive(False)
+        self.bar.pulse()
+        GLib.timeout_add(120, self._pulse)
+
+        def worker():
+            rc = 1
+            try:
+                rc = fn()
+            except Exception as e:                   # noqa: BLE001
+                self._emit(f"执行失败: {e}\n", "err")
+            GLib.idle_add(self._finish, rc, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _emit(self, text, tag=None):
+        GLib.idle_add(self._append, text, tag)
+
+    def _cmd(self, args, timeout=180):
+        """跑一个只读/外围命令，拿 stdout。stderr 丢弃：GUI 的日志流只认 stdout。"""
+        env = dict(os.environ)
+        env.pop("ELECTRON_RUN_AS_NODE", None)
+        try:
+            r = subprocess.run(args, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True,
+                               errors="replace", env=env, timeout=timeout)
+            return r.returncode, r.stdout
+        except FileNotFoundError:
+            return 127, ""
+        except subprocess.TimeoutExpired:
+            return 124, ""
+
+    @staticmethod
+    def _app_dir():
+        return os.path.join(os.path.expanduser("~"), "Applications")
+
+    @staticmethod
+    def _manifest_path(slug):
+        return os.path.join(os.path.expanduser("~"), ".local", "debinstall",
+                            "appimages", slug + ".manifest")
+
+    @staticmethod
+    def _desktop_exec(path):
+        """桌面规范：引号内的 \\ " $ ` 必须转义，防止文件名里的字符翻出去"""
+        q = (path.replace("\\", "\\\\").replace('"', '\\"')
+                  .replace("$", "\\$").replace("`", "\\`"))
+        return f'Exec="{q}" %U'
+
+    @staticmethod
+    def _parse_desktop(text):
+        """扁平解析 .desktop（不处理 groups/locales 之外的语法）"""
+        kv = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if (not line or line.startswith("#") or line.startswith("[")
+                    or "=" not in line):
+                continue
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+        return kv
+
+    @staticmethod
+    def _locale_key(kv, base):
+        """优先中文，其次无后缀"""
+        for suffix in ("[zh_CN]", "[zh]", "[zh_CN.UTF-8]"):
+            if kv.get(base + suffix):
+                return kv[base + suffix]
+        return kv.get(base) or ""
+
+    def _analyze_appimage(self, path):
+        self.kind = "appimage"
+        self._ai_pending = {}
+        self._set_status("正在准备安装应用…", "busy")
+        self._append(f"$ 只读检查 {os.path.basename(path)}\n\n", "info")
+        self._run_thread(lambda: self._appimage_probe(path, self._ai_pending),
+                         self._appimage_scan_done)
+
+    def _appimage_probe(self, path, info):
+        """扫描线程：只写 info 和日志，不碰任何控件（控件更新走 idle_add）"""
+        em = self._emit
+        if not shutil.which("7z"):
+            em("✗ 缺少 7z，读不了 AppImage 里的内容\n", "err")
+            em("安装它：sudo pacman -S p7zip\n", "err")
+            return 1
+
+        em("==> AppImage 只读检查（不挂载、不执行）\n\n", "info")
+
+        # 1) 外壳：必须是 ELF type-2
+        if shutil.which("file"):
+            rc, out = self._cmd(["file", "-b", path])
+            desc = out.strip()
+        else:                                   # 没有 file 就自己看 ELF magic
+            with open(path, "rb") as fh:
+                desc = "ELF" if fh.read(4) == b"\x7fELF" else "not-ELF"
+        info["file_desc"] = desc
+        if "ELF" not in desc:
+            if any(h in desc.lower() for h in _TYPE1_HINT):
+                em("  ✗ 这是 type-1 AppImage（shell 包装），"
+                   "本工具只支持 type-2 单文件\n", "err")
+            else:
+                em(f"  ✗ 不是 ELF 可执行文件（{desc}），可能不是有效包\n", "err")
+            return 1
+        em(f"  ✓ {desc}\n", "ok")
+
+        machine = platform.machine()
+        guest = next((a for hint, a in (("x86-64", "x86_64"), ("aarch64", "aarch64"),
+                                        ("80386", "i686"), ("i386", "i686"))
+                      if hint in desc), None)
+        if guest and machine not in (guest, "x86_64"):
+            em(f"  ! 包为 {guest}，本机为 {machine}，装上也可能跑不起来\n", "warn")
+        info["arch"] = guest
+
+        # 2) 可执行位
+        if os.access(path, os.X_OK):
+            em("  ✓ 已带可执行权限\n", "ok")
+        else:
+            em("  ! 当前不可执行，安装时会自动补上\n", "warn")
+
+        # 3) 目录列表：列 6700 条目不到半秒
+        rc, out = self._cmd(["7z", "l", "-ba", path])
+        if rc != 0:
+            em("  ✗ 7z 无法读取该文件（已损坏或不是 AppImage）\n", "err")
+            return 1
+        files = []
+        for line in out.splitlines():
+            parts = line.split(None, 5)
+            if len(parts) < 6:
+                continue                        # 目录行没有 size/compressed 两列
+            attrs, name = parts[2], parts[5].strip()
+            if attrs.startswith("D") or attrs.startswith("L"):
+                continue                        # 目录和符号链接都不要
+            files.append(name)
+
+        # 根目录下的 <name>.desktop / <name>.png 是指向 usr/ 的符号链接，
+        # 必须用 usr/ 里的真身，否则 7z 抽出来只有一行链接目标。
+        desktops = [n for n in files
+                    if n.startswith("usr/share/applications/")
+                    and n.endswith(".desktop")]
+        icons = [n for n in files
+                 if "/hicolor/" in n
+                 and re.search(r"\.(png|svg|xpm)$", n, re.I)]
+        if not desktops:
+            desktops = [n for n in files if n.endswith(".desktop")]
+        if not desktops:
+            em("  ! 包里没有 .desktop，安装后只有命令行启动方式\n", "warn")
+        else:
+            em(f"  ✓ 应用入口：{os.path.basename(desktops[0])}\n", "ok")
+        if icons:
+            em(f"  ✓ 图标：{len(icons)} 个（取最合适的）\n", "ok")
+        else:
+            em("  ! 包里没有 hicolor 图标，将用通用图标\n", "warn")
+
+        # 4) .desktop 内容
+        text = ""
+        if desktops:
+            rc, text = self._cmd(["7z", "e", "-y", "-so", path, desktops[0]])
+            if rc != 0 or "[Desktop Entry]" not in text:
+                em("  ! .desktop 读取失败，改用文件名推断应用名\n", "warn")
+                text = ""
+        info["desktop_in_pkg"] = desktops[0] if desktops else None
+        info["desktop_text"] = text
+        kv = self._parse_desktop(text)
+        info["kv"] = kv
+
+        stem = os.path.basename(path)
+        stem = re.sub(r"\.appimage$", "", stem, flags=re.I)
+        name = (self._locale_key(kv, "Name")
+                or re.sub(r"[-_][\w.~+-]*$", "", stem) or stem)
+        info["name"] = name
+        # slug 用未本地化的名字：中文系统上也不会生出两个不同标识
+        info["slug"] = slugify(kv.get("StartupWMClass") or kv.get("Name") or stem)
+        info["version"] = (kv.get("X-AppImage-Version")
+                           or self._version_from_filename(stem) or "")
+        info["icon"] = self._pick_icon(icons, kv.get("Icon", ""))
+        info["ident"] = "  ".join(
+            p for p in (name, info["version"]) if p)
+
+        # 5) 审查边界：说清楚 AppImage 看不到什么
+        em("  ! AppImage 是不透明的单一二进制，没有安装脚本可审、"
+           "也不查依赖\n", "warn")
+        em(f"\n==> 应用：{info['ident']}\n", "info")
+        em(f"==> 将移到：~/Applications/{os.path.basename(path)}"
+           f"（原位置的文件会被移走）\n", "info")
+        return 0
+
+    @staticmethod
+    def _version_from_filename(stem):
+        m = re.search(r"[-_](\d+\.\d+(?:\.\d+)?(?:[-+~][\w.]+)?)", stem)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _pick_icon(icons, icon_key):
+        """从 hicolor 图标里挑一个：先按 .desktop 的 Icon 名匹配，再挑最大的尺寸"""
+        if not icons:
+            return None
+        base = os.path.basename(icon_key or "").rsplit(".", 1)[0]
+        cand = icons
+        if base:
+            named = [p for p in icons if os.path.basename(p).split(".")[0] == base]
+            if named:
+                cand = named
+
+        def area(p):
+            m = re.search(r"/(\d+)x(\d+)/", p)
+            return int(m.group(1)) * int(m.group(2)) if m else 0
+
+        return sorted(cand, key=lambda p: (p.endswith(".svg"), area(p)),
+                      reverse=True)[0]
+
+    def _appimage_scan_done(self, rc):
+        if rc == 0:
+            self.ai = self._ai_pending
+            self._slug = self.ai.get("slug")
+            self._id_pkg = self.ai.get("name")
+            self._id_ver = self.ai.get("version") or None
+            self._refresh_identity()
+            self._enter_ready()
+            self._append("\n检查完成 · 点「安装」移入 ~/Applications\n", "ok")
+        else:
+            self._set_status("安装包检查未通过", "err")
+            self.btn_install.set_visible(False)
+            self._append("\n检查未通过，安装按钮保持禁用。\n", "err")
+
+    def _install_appimage(self, path, want_desktop):
+        """移入 ~/Applications + 补可执行位 + 提取图标 + 注册菜单 + 写卸载清单
+        在后台线程跑：只用 self._emit 写日志，不读控件。"""
+        info = self.ai or {}
+        name = info.get("name") or os.path.basename(path)
+        slug = info.get("slug") or slugify(name)
+        em = self._emit
+
+        app_dir = self._app_dir()
+        os.makedirs(app_dir, exist_ok=True)
+        dst = os.path.join(app_dir, os.path.basename(path))
+        if os.path.isdir(dst):
+            em(f"✗ {dst} 是一个目录，不敢覆盖\n", "err")
+            return 1
+
+        em("==> 移入 ~/Applications\n\n", "info")
+        shutil.move(path, dst)
+        os.chmod(dst, 0o755)
+        em(f"  ✓ {dst}\n", "ok")
+
+        created = [dst]
+        tmp = tempfile.mkdtemp(prefix="debinstall-ai-")
+        try:
+            # 图标：从 squashfs 里抽到 hicolor，键名用 slug 以免和别的包撞
+            # 注意用的是移动后的 dst —— 此时原路径已经不存在了
+            icon_target = None
+            if info.get("icon"):
+                rc, _ = self._cmd(["7z", "e", "-y", f"-o{tmp}", dst,
+                                   info["icon"]])
+                src = os.path.join(tmp, os.path.basename(info["icon"]))
+                if rc == 0 and os.path.isfile(src):
+                    m = re.search(r"/hicolor/([^/]+)/", info["icon"])
+                    size = m.group(1) if m else "256x256"
+                    ext = os.path.splitext(info["icon"])[1].lower()
+                    icon_target = os.path.join(
+                        os.path.expanduser("~"), ".local", "share", "icons",
+                        "hicolor", size, "apps", slug + ext)
+                    os.makedirs(os.path.dirname(icon_target), exist_ok=True)
+                    shutil.move(src, icon_target)
+                    created.append(icon_target)
+                    em(f"  ✓ 图标已装到 hicolor/{size}\n", "ok")
+                else:
+                    em("  ! 图标提取失败，继续用主题默认图标\n", "warn")
+
+            # 菜单项：以包内 .desktop 为模板，只改 Exec/Icon
+            menu = os.path.join(os.path.expanduser("~"), ".local", "share",
+                                "applications", slug + ".desktop")
+            os.makedirs(os.path.dirname(menu), exist_ok=True)
+            text = self._appimage_desktop_text(info, dst, slug)
+            with open(menu, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.chmod(menu, 0o644)
+            created.append(menu)
+            em(f"  ✓ 已注册到应用菜单：{name}\n", "ok")
+
+            if shutil.which("update-desktop-database"):
+                self._cmd(["update-desktop-database",
+                           os.path.join(os.path.expanduser("~"),
+                                        ".local", "share", "applications")])
+            if shutil.which("kbuildsycoca6"):
+                self._cmd(["kbuildsycoca6", "--check-globals"])
+
+            if want_desktop:
+                self._appimage_desk_link(menu)
+
+            self._write_manifest(slug, path, dst, menu, icon_target, info)
+            em(f"  ✓ 卸载清单：~/.local/debinstall/appimages/{slug}.manifest\n", "ok")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        em(f"\n下次在应用菜单里搜「{name}」即可启动。\n", "info")
+        return 0
+
+    _AI_DROP_KEYS = ("TryExec", "Path", "KeyFile", "DBusActivatable", "Exec", "Icon")
+
+    def _appimage_desktop_text(self, info, dst, slug):
+        """以包内 .desktop 为模板，只替换 Exec/Icon —— 翻译字段原样保留"""
+        kv = info.get("kv") or {}
+        kept = []
+        for line in (info.get("desktop_text") or "").splitlines():
+            key = line.split("=", 1)[0].strip() if "=" in line else line.strip()
+            if key not in self._AI_DROP_KEYS:
+                kept.append(line)
+        text = "\n".join(kept)
+        if "[Desktop Entry]" not in text:
+            text = "[Desktop Entry]\nType=Application\n" + text
+        text = text.rstrip("\n")
+        for line in ("Type=Application", "Terminal=false", "Categories=Utility;",
+                     "StartupNotify=true", f"Name={info.get('name') or slug}"):
+            key = line.split("=", 1)[0]
+            if not re.search(rf"^{key}=", text, re.M):
+                text += "\n" + line
+        icon = (slug if info.get("icon")
+                else kv.get("Icon") or "application-x-executable")
+        return text + "\n" + self._desktop_exec(dst) + f"\nIcon={icon}\n"
+
+    def _appimage_desk_link(self, menu):
+        """桌面快捷方式：拷贝一份并标记受信任，否则 KDE/GNOME 不让双击"""
+        em = self._emit
+        if shutil.which("xdg-user-dir"):
+            rc, out = self._cmd(["xdg-user-dir", "DESKTOP"], timeout=15)
+            desk = out.strip() if rc == 0 and out.strip() else None
+        else:
+            desk = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not desk or not os.path.isdir(desk):
+            em("  ! 没有可用的桌面目录，跳过桌面快捷方式\n", "warn")
+            return
+        link = os.path.join(desk, os.path.basename(menu))
+        try:
+            shutil.copyfile(menu, link)
+            os.chmod(link, 0o755)
+            if shutil.which("gio"):
+                # KDE/GNOME 要求"受信任"才允许双击，失败不算安装失败
+                self._cmd(["gio", "set", link, "metadata::trusted", "true"],
+                          timeout=15)
+            em(f"  ✓ 桌面快捷方式：{os.path.basename(link)}\n", "ok")
+        except OSError as e:
+            em(f"  ! 桌面快捷方式创建失败：{e}\n", "warn")
+
+    def _write_manifest(self, slug, origin, dst, menu, icon, info):
+        man = self._manifest_path(slug)
+        os.makedirs(os.path.dirname(man), exist_ok=True)
+        fields = [("app", slug), ("name", info.get("name", "")),
+                  ("version", info.get("version", "")), ("origin", origin),
+                  ("appimage", dst), ("desktop", menu),
+                  ("icon", icon or ""),
+                  ("installed", time.strftime("%Y-%m-%dT%H:%M:%S"))]
+        with open(man, "w", encoding="utf-8") as fh:
+            for k, v in fields:
+                fh.write(f"{k}={v}\n")
+
+    # 解析 deb-install 输出 → 应用标识 + 高危门禁（逐行日志进"详细输出"）
+    RE_PKG = re.compile(r"^\s*包名\s+(\S+)")
+    RE_VER = re.compile(r"^\s*版本\s+(\S+)")
+
+    def _consume(self, line):
+        s = line.strip()
+        tag = None
+        if s.startswith("✓"):
+            tag = "ok"
+        elif s.startswith("!"):
+            tag = "warn"
+        elif s.startswith("✗"):
+            tag = "err"
+        elif s.startswith("==>"):
+            tag = "info"
+
+        m = self.RE_PKG.match(line)
+        if m:
+            self.pkg_name = m.group(1)
+            self._id_pkg = m.group(1)
+            self._refresh_identity()
+        m = self.RE_VER.match(line)
+        if m:
+            self._id_ver = m.group(1)
+            self._refresh_identity()
+
+        if "高危" in s:
+            self.dangerous = True
+
+        self._append(line + "\n", tag)
+        return False
+
+    # ── 动作 ────────────────────────────────────────────────────────────
+    def analyze(self):
+        if self.busy:
+            return
+        path = self.entry.get_text().strip()
+        if not path:
+            self._set_status("请先选择安装包", "warn")
+            self._dlg(Gtk.MessageType.INFO, "提示",
+                      "请先选择一个 .deb 或 .AppImage 文件。")
+            return
+        if not os.path.isfile(path):
+            self._set_status("找不到该文件", "err")
+            self._dlg(Gtk.MessageType.ERROR, "找不到文件", path)
+            return
+
+        self._clear_log()
+        self._reset_identity()
+        self._done_state = False
+        self.dangerous = False
+        self.btn_install.set_sensitive(False)
+        self.btn_install.set_visible(False)
+
+        if is_appimage(path):
+            self._analyze_appimage(path)
+            return
+
+        if not self.tool:
+            self._set_status("找不到 deb-install 工具", "err")
+            self._dlg(Gtk.MessageType.ERROR, "缺少组件", "找不到 deb-install 工具。")
+            return
+
+        self.kind = "deb"
+        self._set_status("正在准备安装应用…", "busy")
+        self._append(f"$ deb-install {os.path.basename(path)}\n\n", "info")
+
+        def done(rc):
+            if rc == 0:
+                self._enter_ready()
+                self._append("\n分析完成 · 点「安装」写入系统\n", "ok")
+            else:
+                self._set_status("安装包扫描未通过", "err")
+                self.btn_install.set_visible(False)
+                self._append("\n分析未通过，安装按钮保持禁用。\n", "err")
+
+        self._run([self.tool, path], done)
+
+    def _on_install(self, _btn):
+        if self._done_state:
+            self.close()
+            return
+        if self.busy:
+            return
+        path = self.entry.get_text().strip()
+        if not os.path.isfile(path):
+            return
+        if self.kind == "appimage":
+            self._on_install_appimage(path)
+            return
+        if not self.tool:
+            self._set_status("找不到 deb-install 工具", "err")
+            return
+
+        extra = "" if self.chk_desktop.get_active() else "\n（不创建桌面快捷方式）"
+        if self.dangerous:
+            dlg = Gtk.MessageDialog(
+                transient_for=self, flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.YES_NO, text="这个包的脚本含高危操作")
+            dlg.format_secondary_text(
+                f"{os.path.basename(path)}\n\n"
+                "它的安装脚本里有删除根目录、写块设备、远程脚本直灌 shell 之类的动作，"
+                "安装后会以 root 执行。上面的日志里已用 ✗ 标出了具体行。\n\n"
+                "除非你确定这个包可信，否则请点「否」。仍要继续吗？")
+        else:
+            dlg = Gtk.MessageDialog(
+                transient_for=self, flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO, text=self.install_question)
+            dlg.format_secondary_text(
+                f"将把软件包安装到系统：\n\n{os.path.basename(path)}{extra}\n\n"
+                "这会向 /opt、/usr 写入文件，需要管理员权限。是否继续？")
+        # 对话框弹出期间，横幅同步显示确认阶段（高危仍走红色警告弹窗，不弱化）
+        if self.dangerous:
+            self._set_status("发现高危脚本，需你确认", "warn")
+        else:
+            self._set_status(self.install_question, "ready")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.YES:
+            self._set_status(self.install_question, "ready")
+            return
+
+        self._append("\n" + "─" * 60 + "\n", "info")
+        self._append(f"$ deb-install --install {os.path.basename(path)}\n\n", "info")
+
+        args = [self.tool, "--install"]
+        if not self.chk_desktop.get_active():
+            args.append("--no-desktop")
+        if self.dangerous:
+            args.append("--allow-dangerous")
+        args.append(path)
+
+        self._set_status("正在安装…", "busy")
+        self.btn_install.set_visible(False)
+        self._run(args, self._install_done)
+
+    def _on_install_appimage(self, path):
+        info = self.ai or {}
+        name = info.get("name") or os.path.basename(path)
+        extra = "" if self.chk_desktop.get_active() else "\n（不创建桌面快捷方式）"
+        dlg = Gtk.MessageDialog(
+            transient_for=self, flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO, text=self.install_question)
+        dlg.format_secondary_text(
+            f"{name}\n\n"
+            f"将从原位置移走，放到 ~/Applications/ 并注册进应用菜单。{extra}\n\n"
+            "这一步不需要管理员权限。但 AppImage 是不透明的单一二进制，"
+            "没有安装脚本可审、也查不到依赖 —— 只有你能判断来源是否可信。\n\n"
+            "是否继续？")
+        self._set_status(self.install_question, "ready")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.YES:
+            self._set_status(self.install_question, "ready")
+            return
+
+        self._append("\n" + "─" * 60 + "\n", "info")
+        self._append("$ 安装 AppImage → ~/Applications\n\n", "info")
+        self._set_status("正在安装…", "busy")
+        self.btn_install.set_visible(False)
+        # 复选框状态必须在主线程读，后台任务里不碰控件
+        want_desktop = self.chk_desktop.get_active()
+        self._run_thread(lambda: self._install_appimage(path, want_desktop),
+                         self._install_done)
+
+    def _install_done(self, rc):
+        if rc == 0:
+            self._set_status("已安装应用", "ok")
+            self._append("\n安装完成。\n", "ok")
+            self._done_state = True
+            self.btn_install.set_label("完成")
+            self.btn_install.set_visible(True)
+            self.btn_install.set_sensitive(True)
+        else:
+            self._set_status(f"安装失败（退出码 {rc}）", "err")
+            self._append(f"\n安装未成功（退出码 {rc}）。\n", "err")
+
+    def _dlg(self, kind, title, text):
+        dlg = Gtk.MessageDialog(transient_for=self, flags=Gtk.DialogFlags.MODAL,
+                                message_type=kind, buttons=Gtk.ButtonsType.OK,
+                                text=title)
+        dlg.format_secondary_text(text)
+        dlg.run()
+        dlg.destroy()
+
+    def _on_destroy(self, _w):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:      # noqa: BLE001
+                pass
+        Gtk.main_quit()
+
+
+def main():
+    initial = None
+    if len(sys.argv) > 1 and sys.argv[1] not in ("--", "-"):
+        initial = sys.argv[1]
+    win = DebInstallerUI(initial)
+    win.show_all()
+    # 置顶调试开关
+    if os.environ.get("DEB_UI_TOPMOST") == "1":
+        win.set_keep_above(True)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

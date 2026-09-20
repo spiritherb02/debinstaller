@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=软件包安装程序
+Name[en]=Package Installer
+GenericName=安装 .deb 与 .AppImage 软件包
+GenericName[en]=Install .deb and .AppImage packages
+Comment=图形化分析并安装软件包：.deb 先只读检查依赖与安装脚本，.AppImage 移入 ~/Applications 并注册菜单
+Comment[en]=Analyse and install packages with a GUI: .deb (dependency and script audit) and .AppImage (move into ~/Applications and add a menu entry)
+Exec=deb-install-ui %F
+Icon=system-software-install
+Terminal=false
+Categories=Settings;PackageManager;
+MimeType=application/vnd.debian.binary-package;application/vnd.appimage;
+StartupNotify=false
+NoDisplay=false

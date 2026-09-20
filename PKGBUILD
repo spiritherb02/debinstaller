@@ -1,29 +1,45 @@
 # Maintainer: SpiritHerb <spiritherb@users.noreply.github.com>
 pkgname=debinstaller
-pkgver=1.0.0
+pkgver=2.1.0
 pkgrel=1
-pkgdesc="在 Arch Linux 上安装 Debian .deb 包（转成原生 pacman 包再装）"
+pkgdesc="在 Arch Linux 上安装 Debian .deb 包（转成原生 pacman 包再装），顺带把 .AppImage 收进应用菜单"
 arch=('any')
 url="https://github.com/spiritherb02/debinstaller"
 license=('MIT')
-depends=('python')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+depends=('bash' 'dpkg' 'libarchive' 'fakeroot' 'zstd' 'binutils')
+optdepends=(
+  'python-gobject: 图形界面（软件包安装程序）'
+  'gtk3: 图形界面（软件包安装程序）'
+  'p7zip: 只读检查 .AppImage'
+  'desktop-file-utils: 注册应用菜单'
+  'gtk-update-icon-cache: 刷新图标缓存'
+  'xdg-user-dirs: 桌面快捷方式'
+  'polkit: 图形界面里输入 sudo 密码'
+)
+provides=('deb-install')
+source=("debinstall-$pkgver.tar.gz::$url/releases/download/v$pkgver/debinstall-$pkgver.tar.gz")
+sha256sums=('e05155c8fb8b3ddd8f70b140ccaf7602495d29703aa32061bc8b8407e3ba70d7')
 
 package() {
-  cd "$srcdir/$pkgname-$pkgver"
+  cd "$srcdir/debinstall-$pkgver"
 
-  install -d "$pkgdir/usr/lib/debinstaller" "$pkgdir/usr/bin"
+  # 主程序 + GUI 那套脚本；GUI 里的 @PREFIX_BIN@ 占位符换成真实路径
+  for f in debinstall deb-install-ui deb-install-open deb-install-askpass deb-install-raw; do
+    if [ "$f" = deb-install-ui ]; then
+      sed "s|@PREFIX_BIN@|/usr/bin|g" "bin/$f" > "$pkgdir/usr/bin/$f"
+    else
+      install -Dm755 "bin/$f" "$pkgdir/usr/bin/$f"
+    fi
+  done
+  ln -sfn debinstall "$pkgdir/usr/bin/deb-install"
 
-  cp -r debinstaller "$pkgdir/usr/lib/debinstaller/"
-  find "$pkgdir/usr/lib/debinstaller" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+  # 桌面入口：Exec 要写绝对路径，装到 /usr 之后 xdg 才找得到
+  install -Dm644 share/applications/deb-install.desktop \
+    "$pkgdir/usr/share/applications/deb-install.desktop"
+  sed -i 's|^Exec=deb-install-ui|Exec=/usr/bin/deb-install-ui|' \
+    "$pkgdir/usr/share/applications/deb-install.desktop"
 
-  cat > "$pkgdir/usr/bin/debinstall" <<'ENTRY'
-#!/usr/bin/env python3
-import sys
-sys.path.insert(0, "/usr/lib/debinstaller")
-from debinstaller.cli import main
-sys.exit(main())
-ENTRY
-  chmod 755 "$pkgdir/usr/bin/debinstall"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 share/doc/SKILL.md "$pkgdir/usr/share/doc/$pkgname/SKILL.md"
 }

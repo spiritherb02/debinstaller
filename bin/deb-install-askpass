@@ -1,0 +1,123 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+deb-install-askpass — 图形化 sudo 密码输入框（GTK3 / PyGObject）
+
+用途：deb-install-ui 以 Terminal=false 的方式启动，没有控制终端，
+sudo 无法弹出密码提示。通过 SUDO_ASKPASS 指向本脚本 + `sudo -A`，
+即可在图形界面里正常输入密码。
+
+sudo 调用时会把提示语作为第一个参数传入（如 "[sudo] password for user:"），
+本脚本把用户输入的密码原样打到 stdout。
+"""
+
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk  # noqa: E402
+
+CSS = b"""
+window, .root { background: #2b2b2b; }
+label { color: #e6e6e6; font-size: 13px; }
+entry {
+    background: #1e1e1e; color: #f0f0f0; border: 1px solid #4a4a4a;
+    border-radius: 6px; padding: 7px 10px; font-size: 14px;
+    caret-color: #f0f0f0;
+}
+entry:focus { border-color: #3daee9; }
+button {
+    background: #3a3a3a; color: #e6e6e6; border: 1px solid #4a4a4a;
+    border-radius: 6px; padding: 6px 16px; font-size: 13px;
+}
+button:hover { background: #454545; }
+button.accent { background: #3daee9; color: #ffffff; border-color: #3daee9; }
+button.accent:hover { background: #4cbdf8; }
+.title { font-size: 15px; font-weight: bold; color: #ffffff; }
+.hint  { color: #9a9a9a; font-size: 12px; }
+"""
+
+
+class AskPass:
+    def __init__(self, prompt: str):
+        self.password = None
+
+        self.win = Gtk.Window(title="需要管理员权限")
+        self.win.set_default_size(420, -1)
+        self.win.set_position(Gtk.WindowPosition.CENTER)
+        self.win.set_resizable(False)
+        self.win.set_keep_above(True)
+        self.win.get_style_context().add_class("root")
+        self.win.connect("destroy", Gtk.main_quit)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_border_width(20)
+        self.win.add(outer)
+
+        title = Gtk.Label(label="安装 DEB 包需要管理员权限", xalign=0)
+        title.get_style_context().add_class("title")
+        outer.pack_start(title, False, False, 0)
+
+        clean = prompt.strip() or "请输入密码："
+        sub = Gtk.Label(label=clean, xalign=0)
+        sub.get_style_context().add_class("hint")
+        sub.set_line_wrap(True)
+        outer.pack_start(sub, False, False, 0)
+
+        self.entry = Gtk.Entry()
+        self.entry.set_visibility(False)
+        self.entry.set_placeholder_text("密码")
+        self.entry.set_activates_default(True)
+        outer.pack_start(self.entry, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btns.set_halign(Gtk.Align.END)
+        outer.pack_start(btns, False, False, 0)
+
+        cancel = Gtk.Button(label="取消")
+        cancel.connect("clicked", self._on_cancel)
+        btns.pack_start(cancel, False, False, 0)
+
+        okb = Gtk.Button(label="确定")
+        okb.get_style_context().add_class("accent")
+        okb.set_can_default(True)
+        okb.connect("clicked", self._on_ok)
+        btns.pack_start(okb, False, False, 0)
+        self.win.set_default(okb)
+
+        self.win.show_all()
+        self.win.present()
+        self.entry.grab_focus()
+
+    def _on_ok(self, _w):
+        self.password = self.entry.get_text()
+        Gtk.main_quit()
+
+    def _on_cancel(self, _w):
+        self.password = None
+        Gtk.main_quit()
+
+    def run(self):
+        Gtk.main()
+        return self.password
+
+
+def main():
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "请输入密码："
+    pw = AskPass(prompt).run()
+    if pw is None:
+        sys.exit(1)
+    sys.stdout.write(pw + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

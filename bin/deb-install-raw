@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+#
+# deb-install — 在 Arch Linux 上安装 Debian/Ubuntu 的 .deb 包
+#
+# 默认【只做只读分析】：依赖、安装脚本、写入路径、冲突检测。
+# 确认无误后加 --install 才真正写入系统。
+#
+# 用法:
+#   deb-install <pkg.deb>              只分析（不动系统）
+#   deb-install --install <pkg.deb>    分析并安装
+#   deb-install --list                 列出台账里记录过的安装
+#   deb-install --uninstall <name>     按台账卸载
+#
+set -uo pipefail
+
+R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; D=$'\033[2m'; N=$'\033[0m'
+LEDGER=/var/lib/deb-install
+
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+info() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
+
+# ── 提权 ────────────────────────────────────────────────────────────────
+# 终端里跑：sudo 正常在终端里问密码。
+# 图形界面（deb-install-ui，Terminal=false）里跑：没有控制终端，sudo 问不出来，
+# 于是改走 `sudo -A` + SUDO_ASKPASS，弹一个 GTK 密码框。
+if [ -t 0 ]; then
+    SUDO=(sudo)
+else
+    if [ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/deb-install-askpass" ]; then
+        SUDO_ASKPASS="$HOME/.local/bin/deb-install-askpass"
+        export SUDO_ASKPASS
+    fi
+    if [ -n "${SUDO_ASKPASS:-}" ] && [ -x "$SUDO_ASKPASS" ]; then
+        SUDO=(sudo -A)
+    else
+        SUDO=(sudo)
+    fi
+fi
+
+usage() {
+    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ── 参数 ────────────────────────────────────────────────────────────────
+MODE=analyze
+VERBOSE=0
+MAKE_DESKTOP=1          # 装完默认在桌面建快捷方式；--no-desktop 关闭
+_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --verbose|-v)  VERBOSE=1 ;;
+        --no-desktop)  MAKE_DESKTOP=0 ;;
+        *) _args+=("$_a") ;;
+    esac
+done
+set -- "${_args[@]}"
+
+case "${1:-}" in
+    -h|--help|"") usage ;;
+    --install)   MODE=install;  DEB="${2:-}" ;;
+    --list)      MODE=list ;;
+    --uninstall) MODE=uninstall; PKG="${2:-}" ;;
+    -*)          die "未知参数: $1" ;;
+    *)           DEB="$1" ;;
+esac
+
+# ── 台账 ────────────────────────────────────────────────────────────────
+case "$MODE" in
+list)
+    [ -d "$LEDGER" ] || { echo "台账为空（$LEDGER 不存在）"; exit 0; }
+    printf '%-28s %-12s %s\n' '包名' '版本' '安装时间'
+    for f in "$LEDGER"/*.meta; do
+        [ -e "$f" ] || continue
+        awk -F= '/^name=/{n=$2} /^version=/{v=$2} /^time=/{t=$2}
+                 END{printf "%-28s %-12s %s\n", n, v, t}' "$f"
+    done
+    exit 0
+    ;;
+uninstall)
+    [ -n "$PKG" ] || die "用法: deb-install --uninstall <包名>"
+    META="$LEDGER/$PKG.meta"; LIST="$LEDGER/$PKG.list"
+    [ -f "$LIST" ] || die "台账里没有 $PKG 的记录"
+    [ "$(id -u)" -eq 0 ] || exec "${SUDO[@]}" -- "$0" --uninstall "$PKG"
+    info "将删除以下文件（共 $(wc -l < "$LIST") 项）"
+    sed 's/^/    /' "$LIST" | head -40
+    printf '\n确认卸载？[y/N] '; read -r ans
+    [ "$ans" = y ] || { echo "已取消"; exit 0; }
+    # 逆序删除；-L 用于处理已断掉的符号链接（-e 对断链返回 false）
+    tac "$LIST" | while read -r p; do
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            rm -rf -- "$p"
+        fi
+    done
+    # 清理 /opt 下因此变空的目录（只动 /opt，不碰系统目录）
+    tac "$LIST" | while read -r p; do
+        case "$p" in
+            /opt/*) d=$(dirname "$p"); [ -d "$d" ] && rmdir "$d" 2>/dev/null ;;
+        esac
+    done
+    rm -f "$LIST" "$META"
+    update-desktop-database /usr/share/applications 2>/dev/null
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null
+    ok "已卸载 $PKG"
+    exit 0
+    ;;
+esac
+
+[ -n "${DEB:-}" ] || usage
+[ -f "$DEB" ] || die "找不到文件: $DEB"
+DEB=$(readlink -f "$DEB")
+[[ "$DEB" == *.deb ]] || die "不是 .deb 文件"
+
+command -v ar  >/dev/null || die "缺少 ar（pacman -S binutils）"
+command -v tar >/dev/null || die "缺少 tar"
+
+# ── 拆包 ────────────────────────────────────────────────────────────────
+WORK=$(mktemp -d) || die "无法创建临时目录"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK" || die "无法进入临时目录"
+
+info "拆包 $(basename "$DEB")"
+ar x "$DEB" 2>/dev/null || die "ar 解包失败（文件损坏？）"
+[ -f debian-binary ] || die "不是合法的 deb 包（缺 debian-binary）"
+
+CTL=$(ls control.tar.* 2>/dev/null | head -1)
+DATA=$(ls data.tar.* 2>/dev/null | head -1)
+[ -n "$CTL" ]  || die "缺 control.tar.*"
+[ -n "$DATA" ] || die "缺 data.tar.*"
+
+mkdir -p ctl data
+tar -xf "$CTL"  -C ctl  || die "control 解压失败"
+tar -xf "$DATA" -C data || die "data 解压失败"
+
+# ── 元信息 ──────────────────────────────────────────────────────────────
+get_field() { awk -v k="$1" 'BEGIN{IGNORECASE=0} $0 ~ "^"k": " {sub("^"k": ",""); print; exit}' ctl/control; }
+PKGNAME=$(get_field Package)
+PKGVER=$(get_field Version)
+PKGARCH=$(get_field Architecture)
+DEPENDS=$(get_field Depends)
+HOMEPAGE=$(get_field Homepage)
+
+[ -n "$PKGNAME" ] || die "control 里没有 Package 字段"
+
+echo
+info "包信息"
+printf '  %-14s %s\n' 包名 "$PKGNAME"
+printf '  %-14s %s\n' 版本 "$PKGVER"
+printf '  %-14s %s\n' 架构 "$PKGARCH"
+[ -n "$HOMEPAGE" ] && printf '  %-14s %s\n' 主页 "$HOMEPAGE"
+
+case "$PKGARCH" in
+    amd64|x86_64) ok "架构匹配（amd64）" ;;
+    all)          ok "架构无关（all）" ;;
+    *)            warn "架构是 $PKGARCH，本机通常需要 amd64/x86_64" ;;
+esac
+
+# ── 安装脚本审计 ────────────────────────────────────────────────────────
+echo
+info "安装脚本审计"
+FOUND_SCRIPT=0
+for s in preinst postinst prerm postrm; do
+    [ -f "ctl/$s" ] || continue
+    FOUND_SCRIPT=1
+    printf '  %s--- %s ---%s\n' "$D" "$s" "$N"
+    sed 's/^/      /' "ctl/$s"
+    # 危险模式
+    if grep -qE '(rm[[:space:]]+-[a-zA-Z]*[rR][a-zA-Z]*[[:space:]]+/[[:space:]]*$|rm[[:space:]]+-rf[[:space:]]+/[[:space:]]|dd[[:space:]]+if=|mkfs\.|>[[:space:]]*/dev/sd|curl[^|]*\|[[:space:]]*(ba)?sh|wget[^|]*\|[[:space:]]*(ba)?sh|chown[[:space:]]+-R[[:space:]].*[[:space:]]/)' "ctl/$s"; then
+        bad "上面这个脚本含有高危操作，请人工确认后再安装！"
+    fi
+done
+if [ "$FOUND_SCRIPT" -eq 0 ]; then
+    ok "没有安装脚本（无 postinst 等）"
+else
+    warn "Arch 上这些 Debian 专用逻辑（update-alternatives / AppArmor）多数会被跳过"
+fi
+
+# ── 写入路径 ────────────────────────────────────────────────────────────
+echo
+info "将写入的顶层路径"
+tar -tf "$DATA" 2>/dev/null | awk -F/ 'NF>1{print $2}' | sort -u | sed 's/^/    \//' 
+
+UNSAFE=$(tar -tf "$DATA" 2>/dev/null | awk -F/ 'NF>1{print $2}' | sort -u | grep -vxE 'opt|usr|etc|var|lib' || true)
+[ -n "$UNSAFE" ] && warn "包含非常规顶层目录，请留意：$(echo $UNSAFE | tr '\n' ' ')"
+
+# ── 依赖检查 ────────────────────────────────────────────────────────────
+echo
+info "动态库依赖检查"
+ELF=$(find data/opt data/usr -type f -size +500k -perm -u+x 2>/dev/null | head -1)
+if [ -n "$ELF" ] && head -c 4 "$ELF" | grep -q $'\x7fELF'; then
+    printf '  %s主程序: %s%s\n' "$D" "${ELF#data}" "$N"
+    MISSING=$(ldd "$ELF" 2>/dev/null | awk '/not found/{print $1}')
+    if [ -z "$MISSING" ]; then
+        ok "所有动态库已满足"
+    else
+        bad "缺失库："
+        echo "$MISSING" | sed 's/^/      /'
+        echo
+        warn "Debian 的包名和 Arch 不同，装之前先补上（常见对应关系）:"
+        case "$MISSING" in
+            *libgtk-3*)   echo "      libgtk-3.so.0   → pacman -S gtk3" ;;
+        esac
+        case "$MISSING" in
+            *libnss3*)    echo "      libnss3.so      → pacman -S nss" ;;
+        esac
+        case "$MISSING" in
+            *libXss*)     echo "      libXss.so.1     → pacman -S libxss" ;;
+        esac
+        case "$MISSING" in
+            *libXtst*)    echo "      libXtst.so.6    → pacman -S libxtst" ;;
+        esac
+        case "$MISSING" in
+            *libatspi*)   echo "      libatspi.so.0   → pacman -S at-spi2-core" ;;
+        esac
+        case "$MISSING" in
+            *libsecret*)  echo "      libsecret-1.so.0 → pacman -S libsecret" ;;
+        esac
+        case "$MISSING" in
+            *libnotify*)  echo "      libnotify.so.4  → pacman -S libnotify" ;;
+        esac
+        echo
+        warn "Debian 声明的依赖: $DEPENDS"
+    fi
+else
+    warn "没找到可执行文件，跳过 ldd 检查"
+fi
+
+# ── 冲突检测 ────────────────────────────────────────────────────────────
+echo
+info "冲突检测"
+DESKTOPS=$(tar -tf "$DATA" 2>/dev/null | grep -E '^\./usr/share/applications/[^/]+\.desktop$' | sed 's|^\./usr/share/applications/||')
+CONFLICT=0
+for d in $DESKTOPS; do
+    if [ -e "$HOME/.local/share/applications/$d" ]; then
+        warn "用户级 $d 会遮蔽系统级同名文件"
+        echo "      → 安装后需 mv ~/.local/share/applications/$d{,.bak}"
+        CONFLICT=1
+    fi
+done
+[ "$CONFLICT" -eq 0 ] && ok "没有 desktop 遮蔽冲突"
+
+# 同名玲珑包
+if command -v ll-cli >/dev/null 2>&1; then
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
+        ll-cli list 2>/dev/null | grep -qi "$PKGNAME" && \
+        warn "玲珑里已装了类似的应用，注意单实例锁会互相顶掉"
+fi
+
+# ── 安装 ────────────────────────────────────────────────────────────────
+echo
+if [ "$MODE" != install ]; then
+    info "这是只读分析，没有改动系统"
+    echo "    确认无误后执行： deb-install --install $(basename "$DEB")"
+    exit 0
+fi
+
+info "开始安装 $PKGNAME $PKGVER"
+"${SUDO[@]}" -v || die "需要 sudo 权限"
+
+# 记录原始清单用于卸载
+"${SUDO[@]}" mkdir -p "$LEDGER"
+tar -tf "$DATA" 2>/dev/null \
+    | sed -n 's|^\./|/|p' \
+    | grep -vE '/$' \
+    | "${SUDO[@]}" tee "$LEDGER/$PKGNAME.list" >/dev/null
+printf 'name=%s\nversion=%s\ntime=%s\ndeb=%s\n' \
+    "$PKGNAME" "$PKGVER" "$(date '+%F %T')" "$DEB" \
+    | "${SUDO[@]}" tee "$LEDGER/$PKGNAME.meta" >/dev/null
+
+"${SUDO[@]}" tar -xf "$DATA" -C / || die "铺开文件失败"
+ok "文件已铺开"
+
+# 符号链接：优先找 /opt 下的主程序
+LINKED=0
+while IFS= read -r exe; do
+    [ -z "$exe" ] && continue
+    base=$(grep -oE '[^/]+$' <<<"$exe" | head -1)
+    if [ -n "$base" ] && [ ! -e "/usr/bin/$base" ]; then
+        if "${SUDO[@]}" ln -sf "$exe" "/usr/bin/$base"; then
+            ok "建立链接 /usr/bin/$base → $exe"
+            echo "/usr/bin/$base" | "${SUDO[@]}" tee -a "$LEDGER/$PKGNAME.list" >/dev/null
+            LINKED=1
+        fi
+        break
+    fi
+done < <(tar -tf "$DATA" 2>/dev/null | grep -E '^\./opt/[^/]+/[^/]+$' | sed 's|^\.||' | head -5)
+[ "$LINKED" -eq 0 ] && warn "没自动建符号链接，如启动失败请手动 ln -sf"
+
+# Electron 沙箱
+SB=$(find /opt -maxdepth 3 -name chrome-sandbox -newermt '-2 minutes' 2>/dev/null | head -1)
+if [ -n "$SB" ]; then
+    if [[ -L /proc/self/ns/user ]] && unshare --user true 2>/dev/null; then
+        "${SUDO[@]}" chmod 0755 "$SB"; ok "chrome-sandbox → 0755（有 user namespace）"
+    else
+        "${SUDO[@]}" chmod 4755 "$SB"; ok "chrome-sandbox → 4755（SUID 回退）"
+    fi
+fi
+
+"${SUDO[@]}" update-desktop-database /usr/share/applications 2>/dev/null
+"${SUDO[@]}" gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null
+ok "桌面/图标数据库已刷新"
+
+# ── 桌面快捷方式 ────────────────────────────────────────────────────────
+if [ "$MAKE_DESKTOP" -eq 1 ]; then
+    DESKTOP_DIR=$(xdg-user-dir DESKTOP 2>/dev/null)
+    [ -n "$DESKTOP_DIR" ] || DESKTOP_DIR="$HOME/Desktop"
+    if [ -d "$DESKTOP_DIR" ]; then
+        MADE=0
+        for d in $DESKTOPS; do
+            SRC="/usr/share/applications/$d"
+            [ -f "$SRC" ] || continue
+            # 快捷方式文件名取中文名，回退到 Name，再回退到 desktop 文件名
+            LABEL=$(awk -F= '/^Name\[zh_CN\]=/{print $2; exit}' "$SRC")
+            [ -n "$LABEL" ] || LABEL=$(awk -F= '/^Name=/{print $2; exit}' "$SRC")
+            [ -n "$LABEL" ] || LABEL="${d%.desktop}"
+            DEST="$DESKTOP_DIR/$LABEL.desktop"
+            if cp -f "$SRC" "$DEST" && chmod +x "$DEST"; then
+                ok "桌面快捷方式 → $LABEL.desktop"
+                # 台账要记上，否则卸载时它会残留
+                echo "$DEST" | "${SUDO[@]}" tee -a "$LEDGER/$PKGNAME.list" >/dev/null
+                MADE=1
+            fi
+        done
+        [ "$MADE" -eq 0 ] && warn "这个包里没有 .desktop，跳过桌面快捷方式"
+    else
+        warn "桌面目录不存在：$DESKTOP_DIR"
+    fi
+fi
+
+echo
+info "安装完成"
+echo "    台账: sudo deb-install --list"
+echo "    卸载: sudo deb-install --uninstall $PKGNAME"
+echo
+warn "启动测试时记得避开 ELECTRON_RUN_AS_NODE 污染："
+echo "      setsid env -u ELECTRON_RUN_AS_NODE <应用路径>"
