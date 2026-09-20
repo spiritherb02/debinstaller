@@ -349,6 +349,31 @@ _install_appimage(path, want_desktop)
 
 改完跑 `probe-appimage.py`（§4.5 第 3 条），它不需要显示环境。
 
+`slug` 这个字段会当文件名用（`.desktop`、卸载清单、图标名三处）。它优先取
+`StartupWMClass`，其次未本地化的 `Name`，**并且必须在这些都是纯中文时退回
+文件名** —— 否则 `slugify("软件包安装程序")` 会得到通用的 `appimage`，
+两个中文名的 AppImage 会互相覆盖菜单项。`run-checks.sh` 里有这条静态守卫。
+
+### 5.7 打本工具自己的 .AppImage（可行性结论）
+
+`./build-appimage.sh` 组装 AppDir 是通的（`--appdir-only` 随时可验，
+`desktop-file-validate` 也过）；**只差两样脚本刻意不去自动下载的东西**：
+
+| 缺什么 | 怎么补 |
+|---|---|
+| `mksquashfs` | `sudo pacman -S squashfs-tools`（extra 里有） |
+| type-2 runtime（ELF 头） | 从 AppImageKit release 拿 `runtime-x86_64`，自己核对校验和，再用 `APPIMAGE_RUNTIME=<路径>` 指过来 |
+
+结论：**能做，但价值有限，所以本版没随发布放 AppImage。** 原因是这个工具的
+正文是 shell + Python，运行时要调宿主的 `pacman` / `dpkg-deb` / `fakeroot`，
+图形界面还要宿主的 `python-gobject` + `gtk3` —— 这些 AppImage 装不进去，
+它省掉的只是"安装本工具"这一步，不是"任何发行版都能跑"。也就是说打出来的
+仍然是 Arch-only 的包，和 tar.gz 相比只多了免安装。
+
+顺带一提：真打出来之后，把它双击丢给本工具自己就能装（`.AppImage` 分支会
+认出 `usr/share/applications/` 里的桌面入口和 hicolor 图标）—— 这是
+`build-appimage.sh` 里那两份 `.desktop` 和图标目录存在的原因，别精简掉。
+
 ---
 
 ## 6. 待办清单（按建议优先级）

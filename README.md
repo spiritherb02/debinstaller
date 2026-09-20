@@ -166,6 +166,10 @@ deb-install --raw 某个包.deb        # 不走 pacman，直接解包铺到 /
 - **AppImage 分支只看元数据。** 不检查依赖、不审安装脚本（AppImage 里
   也没有），并且目前没有图形化的卸载入口 —— 手动删 `~/Applications` 里
   那个文件和 `~/.local/share/applications/<名字>.desktop` 即可。
+- **本程序自己没有发布 `.AppImage` 版。** `build-appimage.sh` 能组装出
+  合法的 AppDir，但打出来仍然是 Arch-only：它运行时调宿主的
+  `pacman` / `dpkg-deb`，图形界面还要宿主的 `python-gobject` + `gtk3`，
+  这些都装不进 AppImage。理由写在 `devkit/HANDOFF.md` §5.7。
 
 ---
 
@@ -200,6 +204,7 @@ deb-install --raw 某个包.deb        # 不走 pacman，直接解包铺到 /
 ├── install.sh                      # 安装脚本
 ├── uninstall.sh                    # 卸载脚本
 ├── build.sh                        # 从 bin/ 打发布 tar.gz（+ sha256）
+├── build-appimage.sh               # 打本工具自己的 .AppImage（需要 squashfs-tools）
 ├── README.md
 ├── PKGBUILD                        # Arch 打包（用发布 tar.gz 作 source）
 ├── bin/

@@ -372,6 +372,10 @@ else
     # slug 会当文件名用，必须证明它过滤过
     check "slugify 只留安全字符" grep_F "$UITOOL" '[^0-9A-Za-z_.+-]+'
 
+    # 纯中文的 Name 会被 slugify 掏成通用的 "appimage"，两个应用会抢
+    # 同一个 <slug>.desktop —— 必须留一条退回文件名的路
+    check "slug 退化成通用值时用文件名兜底" grep_F "$UITOOL" 'if s != "appimage"'
+
     # ── 桌面入口与关联 ──
     DESK="${DESK:-$HOME/.local/share/applications/deb-install.desktop}"
     if [ -f "$DESK" ]; then

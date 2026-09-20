@@ -18,7 +18,7 @@ optdepends=(
 )
 provides=('deb-install')
 source=("debinstall-$pkgver.tar.gz::$url/releases/download/v$pkgver/debinstall-$pkgver.tar.gz")
-sha256sums=('e05155c8fb8b3ddd8f70b140ccaf7602495d29703aa32061bc8b8407e3ba70d7')
+sha256sums=('a128231658775cc1d1ac9933739fb6939c140c815efa8bc7762a338ef785446b')
 
 package() {
   cd "$srcdir/debinstall-$pkgver"

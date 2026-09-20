@@ -582,8 +582,14 @@ class DebInstallerUI(Gtk.Window):
         name = (self._locale_key(kv, "Name")
                 or re.sub(r"[-_][\w.~+-]*$", "", stem) or stem)
         info["name"] = name
-        # slug 用未本地化的名字：中文系统上也不会生出两个不同标识
-        info["slug"] = slugify(kv.get("StartupWMClass") or kv.get("Name") or stem)
+        # slug 用未本地化的名字：中文系统上也不会生出两个不同标识。
+        # 中文名会被 slugify 掏成通用的 "appimage"，那时退回文件名 ——
+        # 不然两个应用会抢同一个 <slug>.desktop。
+        info["slug"] = next(
+            (s for s in (slugify(kv.get("StartupWMClass") or ""),
+                         slugify(kv.get("Name") or ""),
+                         slugify(stem)) if s != "appimage"),
+            "appimage")
         info["version"] = (kv.get("X-AppImage-Version")
                            or self._version_from_filename(stem) or "")
         info["icon"] = self._pick_icon(icons, kv.get("Icon", ""))
